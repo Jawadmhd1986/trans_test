@@ -61,7 +61,10 @@
           <!-- JS will create boxes (.trip-card) inside here -->
           <div id="truckTypeContainer"></div>
 
+          <!-- Existing button -->
           <button type="button" id="add-truck-type" class="btn-add">+ Add Truck Type</button>
+          <!-- NEW button (added) -->
+          <button type="button" id="btnAddRoute" class="btn-add">+ Add From / To</button>
         </div>
 
         <!-- Cargo Type -->
@@ -90,7 +93,7 @@
       <span>DSV Assistant</span>
       <button id="chat-close" title="Close chat">×</button>
     </div>
-    <div id="chat-messages" class="chat-messages"></div>
+    <div class="chat-messages" id="chat-messages"></div>
     <div class="chat-footer">
       <input type="text" id="chat-input" placeholder="Type a message…" />
       <button id="chat-send" type="button">Send</button>
@@ -104,6 +107,37 @@
     window.LOCAL_TRUCKS = {{ local_trucks|tojson }};
     window.CICPA_TRUCKS = {{ cicpa_trucks|tojson }};
   </script>
+
+  <!-- Your chatbot JS (unchanged) -->
   <script src="{{ url_for('static', filename='chatbot.js') }}"></script>
+
+  <!-- Minimal From/To adder (keeps style & backend exactly as-is) -->
+  <script>
+  (function () {
+    const addBtn = document.getElementById('btnAddRoute');
+    if (!addBtn) return;
+
+    const fromSel = document.getElementById('origin');
+    const toSel   = document.getElementById('destination');
+    if (!fromSel || !toSel) return;
+
+    // Find the row that contains both selects
+    const routeRow   = fromSel.closest('.form-row');
+    const routesWrap = routeRow ? routeRow.parentElement : null;
+    if (!routeRow || !routesWrap) return;
+
+    addBtn.addEventListener('click', () => {
+      const clone = routeRow.cloneNode(true);
+
+      // Reset selects and remove duplicate IDs (names stay the same)
+      clone.querySelectorAll('select').forEach(s => {
+        s.selectedIndex = 0;
+        if (s.id) s.removeAttribute('id'); // avoid duplicate IDs
+      });
+
+      routesWrap.appendChild(clone);
+    });
+  })();
+  </script>
 </body>
 </html>
