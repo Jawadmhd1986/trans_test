@@ -232,3 +232,29 @@ html,body{
     right:1rem;
   }
 }
+
+/* === MULTI FROM/TO ADD-ON (append only) === */
+.request-block{
+  border:2px solid var(--blue-dsv);
+  border-radius:12px;
+  padding:16px;
+  margin:16px 0;
+  background:#fff;
+}
+.request-actions{
+  display:flex; gap:.5rem; flex-wrap:wrap; margin-top:.5rem;
+}
+.btn-add-ft{
+  padding:.55rem .9rem;
+  background:#eef3ff;
+  color:var(--blue-dsv);
+  border:1px solid #c9d7ff;
+  border-radius:10px;
+  font-weight:700; cursor:pointer;
+}
+.btn-add-ft:hover{ background:#e1ebff; }
+
+/* truck row utility (non-destructive; matches your current layout) */
+.truck-type-row .qty-wrapper input[type="number"]{ width:70px; }
+.btn-remove{ padding:.5rem .8rem; border:1px solid #e0e0e0; background:#f6f6f6; border-radius:10px; cursor:pointer; }
+.btn-remove:hover{ background:#eee; }
