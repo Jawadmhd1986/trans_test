@@ -4,178 +4,106 @@
   <meta charset="UTF-8" />
   <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Transportation Quotation</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <title>DSV Transportation Quotation</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
 <body>
-  <!-- Fixed DSV logo -->
-  <img src="{{ url_for('static', filename='dsv_logo.png') }}" alt="DSV" class="dsv-logo"/>
+  <!-- Floating DSV logo (stays outside the card) -->
+  <img src="{{ url_for('static', filename='dsv_logo.png') }}" alt="DSV Logo" class="dsv-logo" />
 
   <section class="quote-section">
     <div class="quote-card">
       <h1>Transportation Quotation</h1>
 
-      <form id="transportForm" action="{{ url_for('generate_transport') }}" method="POST">
-
-        <!-- ROUTE ROWS (From / To) -->
-        <div class="form-group-block">
-          <div class="row-title">From</div>
-          <div class="row-title">To</div>
-
-          <div id="route-list">
-            <!-- First (template) route row -->
-            <div class="route-row form-row">
-              <div class="form-group">
-                <select name="origin[]" id="origin" required>
-                  <option value="">— Select Pickup —</option>
-                  {% for o in origins %}
-                    <option value="{{ o }}">{{ o }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="form-group">
-                <select name="destination[]" id="destination" required>
-                  <option value="">— Select City —</option>
-                  {% for d in destinations %}
-                    <option value="{{ d }}">{{ d }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-            </div>
+      <form action="{{ url_for('generate_transport') }}" method="POST">
+        <!-- From / To -->
+        <div class="form-row">
+          <div class="form-group">
+            <label for="origin">From</label>
+            <select id="origin" name="origin" required>
+              <option value="">— Select Pickup —</option>
+              {% for o in origins %}
+                <option>{{ o }}</option>
+              {% endfor %}
+            </select>
           </div>
 
-          <!-- Buttons row: Add Truck Type (yours) + Add From/To (new) -->
-          <div class="form-row" style="gap:.5rem; margin-top:.5rem;">
-            <!-- Your existing button (keep same id/class) -->
-            <button type="button" id="btnAddTruck" class="btn-add">+ Add Truck Type</button>
-            <!-- NEW button (added) -->
-            <button type="button" id="btnAddRoute" class="btn-add">+ Add From / To</button>
+          <div class="form-group">
+            <label for="destination">To</label>
+            <select id="destination" name="destination" required>
+              <option value="">— Select City —</option>
+              {% for d in destinations %}
+                <option>{{ d }}</option>
+              {% endfor %}
+            </select>
           </div>
         </div>
 
-        <!-- TRUCK TYPES GROUP -->
-        <div class="group-box">
-          <div class="group-title">Truck Types</div>
-
-          <!-- Main (header) Trip Type -->
-          <label class="sub-label">Trip Type</label>
-          <div class="trip-toggle">
-            <input type="radio" name="trip_type" id="trip_oneway" value="one_way" checked>
-            <label for="trip_oneway" class="pill">One Way</label>
-            <input type="radio" name="trip_type" id="trip_backload" value="back_load">
-            <label for="trip_backload" class="pill">Back Load</label>
+        <!-- Trip Type (will be moved INSIDE the first box by JS) -->
+        <div id="tripTypeGroup" class="form-group">
+          <label>Trip Type</label>
+          <div class="trip-options">
+            <label class="selected">
+              <input type="radio" name="trip_type" value="one_way" checked />
+              <span>One Way</span>
+            </label>
+            <label>
+              <input type="radio" name="trip_type" value="back_load" />
+              <span>Back Load</span>
+            </label>
           </div>
+        </div>
 
-          <!-- First truck row -->
-          <div id="truck-list" class="stack">
-            <div class="truck-row group-row">
-              <div class="form-group">
-                <label class="tiny">Type</label>
-                <select name="truck_type[]" class="truck-type">
-                  <option value="">— Select Truck Type —</option>
-                  {% for t in truck_types %}
-                    <option value="{{ t }}">{{ t }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="form-group" style="max-width:120px;">
-                <label class="tiny">QTY</label>
-                <input type="number" name="truck_qty[]" class="truck-qty" min="1" step="1" value="1"/>
-              </div>
-              <!-- Optional per-row trip override (kept hidden unless you want to show) -->
-              <div class="form-group" style="max-width:160px;">
-                <label class="tiny">Trip</label>
-                <select name="trip_kind[]" class="trip-kind">
-                  <option value="">(Use main)</option>
-                  <option value="one_way">One Way</option>
-                  <option value="back_load">Back Load</option>
-                </select>
-              </div>
+        <!-- Truck Types heading + cards container -->
+        <div class="form-group">
+          <label>Truck Types</label>
 
-              <!-- Remove truck row button (your style name) -->
-              <button type="button" class="btn-remove" data-role="remove-truck">Clear</button>
-            </div>
-          </div>
+          <!-- JS will create boxes (.trip-card) inside here -->
+          <div id="truckTypeContainer"></div>
+
+          <button type="button" id="add-truck-type" class="btn-add">+ Add Truck Type</button>
         </div>
 
         <!-- Cargo Type -->
         <div class="form-group">
           <label for="cargo_type">Cargo Type</label>
-          <select id="cargo_type" name="cargo_type">
+          <select id="cargo_type" name="cargo_type" required>
             <option value="general">General Cargo</option>
             <option value="chemical">Chemical Load</option>
+            <option value="container">Container</option>
           </select>
         </div>
 
-        <!-- Generate -->
         <button type="submit" class="btn-generate">Generate</button>
       </form>
     </div>
   </section>
 
-  <!-- Chat assets (untouched) -->
-  <button class="chat-toggle" type="button" aria-label="Open chat">💬</button>
-  <div class="chat-window" id="chatWin" aria-live="polite">
+  <!-- Chat toggle -->
+  <button class="chat-toggle" aria-label="Chat with DSV">
+    <img src="{{ url_for('static', filename='chat-icon.png') }}" alt="Chat" />
+  </button>
+
+  <!-- Chat box -->
+  <div id="chat-box" class="chat-box" aria-live="polite">
     <div class="chat-header">
-      <div class="chat-title">
-        <span class="logo"></span>
-        <span>DSV Chat</span>
-      </div>
-      <button id="chat-close" type="button" title="Close">✕</button>
+      <span>DSV Assistant</span>
+      <button id="chat-close" title="Close chat">×</button>
     </div>
-    <div class="chat-body" id="chat-box"></div>
+    <div id="chat-messages" class="chat-messages"></div>
     <div class="chat-footer">
-      <input id="chat-input" type="text" placeholder="Type a message..." />
+      <input type="text" id="chat-input" placeholder="Type a message…" />
       <button id="chat-send" type="button">Send</button>
     </div>
   </div>
 
-  <!-- Your chatbot JS (unchanged) -->
-  <script src="{{ url_for('static', filename='chatbot.js') }}"></script>
-
-  <!-- Minimal, self-contained JS for ONLY the new From/To feature; nothing else touched -->
+  <!-- Globals for JS -->
   <script>
-  (function () {
-    const routeList = document.getElementById('route-list');
-    const addRouteBtn = document.getElementById('btnAddRoute');
-    if (!routeList || !addRouteBtn) return;
-
-    function makeClearBtn() {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'btn-remove';
-      b.textContent = 'Clear';
-      b.addEventListener('click', () => {
-        const row = b.closest('.route-row');
-        if (!row) return;
-        // keep the very first route row; allow clearing any added rows
-        if (routeList.children.length > 1) row.remove();
-        else row.querySelectorAll('select').forEach(s => s.selectedIndex = 0);
-      });
-      return b;
-    }
-
-    addRouteBtn.addEventListener('click', () => {
-      const first = routeList.querySelector('.route-row');
-      if (!first) return;
-
-      const clone = first.cloneNode(true);
-      clone.querySelectorAll('select').forEach(sel => sel.selectedIndex = 0);
-
-      // add a small Clear button at the end of the row if not present
-      if (!clone.querySelector('.btn-remove')) {
-        const holder = document.createElement('div');
-        holder.style.display = 'flex';
-        holder.style.alignItems = 'flex-end';
-        holder.style.marginLeft = '8px';
-        holder.appendChild(makeClearBtn());
-        clone.appendChild(holder);
-        clone.style.alignItems = 'flex-end';
-        clone.style.gap = '8px';
-      }
-      routeList.appendChild(clone);
-    });
-  })();
+    window.TRUCK_TYPES  = {{ truck_types|tojson }};
+    window.CICPA_CITIES = {{ cicpa_cities|tojson }};
+    window.LOCAL_TRUCKS = {{ local_trucks|tojson }};
+    window.CICPA_TRUCKS = {{ cicpa_trucks|tojson }};
   </script>
+  <script src="{{ url_for('static', filename='chatbot.js') }}"></script>
 </body>
 </html>
