@@ -15,7 +15,7 @@
     <div class="quote-card">
       <h1>Transportation Quotation</h1>
 
-      <form action="{{ url_for('generate_transport') }}" method="POST">
+      <form action="{{ url_for('generate_transport') }}" method="POST" id="transportForm">
         <!-- From / To -->
         <div class="form-row">
           <div class="form-group">
@@ -39,7 +39,7 @@
           </div>
         </div>
 
-        <!-- Trip Type (will be moved INSIDE the first box by JS) -->
+        <!-- Trip Type -->
         <div id="tripTypeGroup" class="form-group">
           <label>Trip Type</label>
           <div class="trip-options">
@@ -58,13 +58,15 @@
         <div class="form-group">
           <label>Truck Types</label>
 
-          <!-- JS will create boxes (.trip-card) inside here -->
+          <!-- Your JS (if any) can still create boxes here -->
           <div id="truckTypeContainer"></div>
 
-          <!-- Existing button -->
+          <!-- Buttons row -->
           <button type="button" id="add-truck-type" class="btn-add">+ Add Truck Type</button>
-          <!-- NEW button (added) -->
           <button type="button" id="btnAddRoute" class="btn-add">+ Add From / To</button>
+
+          <!-- Inserted route blocks appear immediately below this anchor -->
+          <div id="routeBlocksAnchor"></div>
         </div>
 
         <!-- Cargo Type -->
@@ -111,41 +113,59 @@
   <!-- Your chatbot JS (unchanged) -->
   <script src="{{ url_for('static', filename='chatbot.js') }}"></script>
 
-  <!-- Minimal From/To adder (keeps style & backend exactly as-is) -->
+  <!-- Template for the mini route block (hidden) -->
+  <template id="routeBlockTpl">
+    <div class="group-box route-block">
+      <div class="group-row">
+        <div class="form-group">
+          <label class="tiny">Type</label>
+          <select name="truck_type[]" class="truck-type" required>
+            <option value="">— Select Truck Type —</option>
+            {% for t in truck_types %}
+              <option value="{{ t }}">{{ t }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="form-group" style="max-width:120px;">
+          <label class="tiny">QTY</label>
+          <input type="number" name="truck_qty[]" class="truck-qty" min="1" step="1" value="1" />
+        </div>
+
+        <button type="button" class="btn-remove" data-role="route-clear">Clear</button>
+      </div>
+
+      <div class="form-group" style="margin-top:.5rem;">
+        <label class="tiny">Trip Type</label>
+        <select name="trip_kind[]" class="trip-kind">
+          <option value="">(Use main)</option>
+          <option value="one_way">One Way</option>
+          <option value="back_load">Back Load</option>
+        </select>
+      </div>
+    </div>
+  </template>
+
+  <!-- Minimal script to drop the block directly under the buttons -->
   <script>
-// Add From/To without changing style or layout
-(function () {
-  const addBtn = document.getElementById('btnAddRoute');
-  if (!addBtn) return;
+  (function () {
+    const addBtn   = document.getElementById('btnAddRoute');
+    const tpl      = document.getElementById('routeBlockTpl');
+    const anchor   = document.getElementById('routeBlocksAnchor');
+    if (!addBtn || !tpl || !anchor) return;
 
-  const fromSel = document.getElementById('origin');
-  const toSel   = document.getElementById('destination');
-  if (!fromSel || !toSel) return;
+    function wireBlock(block) {
+      const clr = block.querySelector('[data-role="route-clear"]');
+      if (clr) clr.addEventListener('click', () => block.remove());
+    }
 
-  // Mark the first row so we can insert new ones right after it
-  const firstRow = fromSel.closest('.form-row');
-  if (!firstRow) return;
-  firstRow.classList.add('route-row');
-
-  addBtn.addEventListener('click', () => {
-    // Always clone the first route row
-    const clone = firstRow.cloneNode(true);
-
-    // Reset selects and remove duplicate IDs
-    clone.querySelectorAll('select').forEach(s => {
-      s.selectedIndex = 0;
-      if (s.id) s.removeAttribute('id');
+    addBtn.addEventListener('click', () => {
+      const node = tpl.content.firstElementChild.cloneNode(true);
+      wireBlock(node);
+      // Insert block right under the two buttons (at the anchor)
+      anchor.insertAdjacentElement('afterend', node);
     });
-
-    // Tag the clone and insert it *after the last* route row
-    clone.classList.add('route-row');
-    const parent = firstRow.parentElement;
-    const rows = parent.querySelectorAll('.route-row');
-    const last = rows[rows.length - 1];
-    last.insertAdjacentElement('afterend', clone);
-  });
-})();
-</script>
+  })();
+  </script>
 </body>
 </html>
-
