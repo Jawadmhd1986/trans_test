@@ -301,160 +301,160 @@ def home():
 
 @app.route("/generate_transport", methods=["POST"])
 def generate_transport():
-    # How many route groups were posted (managed by hidden input groups_count)
-    try:
-        groups_count = int(request.form.get("groups_count", "1"))
-    except:
-        groups_count = 1
-    groups_count = max(1, groups_count)
+    origin         = (request.form.get("origin") or "").strip()
+    destination    = (request.form.get("destination") or "").strip()
+    main_trip      = (request.form.get("trip_type") or "one_way").strip()   # top radio
+    cargo_type     = (request.form.get("cargo_type") or "general").strip().lower()
 
-    # Use your existing template path
+    truck_types    = request.form.getlist("truck_type[]") or []
+    truck_qty_list = request.form.getlist("truck_qty[]") or []
+    # Per-row trip drop-downs (if user only added them for additional rows,
+    # this list will be shorter than the number of truck rows).
+    per_row_trips_raw = request.form.getlist("trip_kind[]") or []
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Normalize per-row trips and build a list the same length as trucks.
+    # If we have fewer trip selectors than truck rows, assume they belong
+    # to the LAST N rows; the first rows use the main trip.
+    # Example: 2 trucks, 1 per-row trip posted -> [main_trip, posted_trip]
+    # ──────────────────────────────────────────────────────────────────────
+    def norm_trip(v):
+        v = (v or "").strip().lower()
+        return v if v in ("one_way", "back_load") else main_trip
+
+    per_row_trips = [norm_trip(v) for v in per_row_trips_raw]
+
+    # normalize selected trucks into keys + qty
+    chosen_trucks = []
+    for t_label, q in zip(truck_types, truck_qty_list):
+        try:
+            qty = int(float(q or "0"))
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+
+        norm_key = None
+        for k, v in TRUCK_LABELS.items():
+            if v.lower() == (t_label or "").strip().lower():
+                norm_key = k
+                break
+        norm_key = norm_key or norm_truck(t_label)
+        if norm_key in TRUCK_LABELS:
+            chosen_trucks.append((norm_key, qty))
+
+    # Build a trip list that aligns 1:1 with chosen_trucks.
+    # If counts match, map directly. If not, assume posted trips
+    # are for the last N rows; the first rows use main_trip.
+    N = len(chosen_trucks)
+    M = len(per_row_trips)
+    if M >= N:
+        row_trip_list = per_row_trips[:N]
+    else:
+        prefix = [main_trip] * (N - M)
+        row_trip_list = prefix + per_row_trips
+
+    # CICPA flags / allowed trucks
+    is_cicpa_city = cicpa_required_for(destination)
+    cicpa_flag = " (CICPA)" if is_cicpa_city else " (Non-CICPA)"
+    allowed_display_trucks = set(
+        RATES.get("__cicpa_trucks__") if is_cicpa_city else RATES.get("__local_trucks__")
+    )
+
+    subtotal = DEC("0")
+    per_truck_rows = []
+    header_trip_labels = []
+
+    for (t_key, qty), row_trip in zip(chosen_trucks, row_trip_list):
+        label = TRUCK_LABELS[t_key]
+
+        # per-row trip application
+        way_mult = DEC("2.00") if row_trip == "back_load" else DEC("1.00")
+        row_trip_tag = " (Back Load)" if row_trip == "back_load" else ""
+        header_trip_labels.append("Back Load" if row_trip == "back_load" else "One Way")
+
+        # CICPA truck filtering
+        if label not in allowed_display_trucks:
+            per_truck_rows.append(
+                (f"{label} x {qty} — {origin} → {destination}{cicpa_flag} (Not available for this selection)",
+                 "", "")
+            )
+            continue
+
+        base_rate = lookup_rate(origin, destination, label, cargo_type)
+        if base_rate is None:
+            per_truck_rows.append(
+                (f"{label} x {qty} — {origin} → {destination}{cicpa_flag} (No rate found)",
+                 "", "")
+            )
+            continue
+
+        unit_per_truck = base_rate * way_mult
+        combined = unit_per_truck * qty
+
+        per_truck_rows.append(
+            (f"{label} x {qty} — {origin} → {destination}{cicpa_flag}{row_trip_tag}",
+             f"AED {money(unit_per_truck)}",
+             f"AED {money(combined)}")
+        )
+        subtotal += combined
+
+    grand_total = subtotal
+
+    # Header “Trip Type”: if all rows share the same label, show it; otherwise “Mixed”
+    if not header_trip_labels:
+        trip_label_for_header = "One Way" if main_trip == "one_way" else "Back Load"
+    else:
+        uniq = set(header_trip_labels)
+        trip_label_for_header = uniq.pop() if len(uniq) == 1 else "Mixed"
+
+    truck_summary = "; ".join(f"{TRUCK_LABELS[t]} x {q}" for t, q in chosen_trucks) or "N/A"
+    route_str = f"{origin} \u2192 {destination}{cicpa_flag}" if (origin and destination) else "N/A"
+
     tpl_path = os.path.join("templates", "TransportQuotation.docx")
     if not os.path.exists(tpl_path):
         return jsonify({"error": "TransportQuotation.docx not found under templates/"}), 500
 
     doc = Document(tpl_path)
-
-    # Optional: clear top-level placeholders if present (harmless if not found)
     placeholders = {
         "{{TODAY_DATE}}": datetime.today().strftime("%d %b %Y"),
-        "{{FROM}}": "", "{{TO}}": "", "{{TRUCK_TYPE}}": "", "{{GENERAL}}": "",
-        "{{CHEMICAL}}": "", "{{TRIP_TYPE}}": "", "{{CICPA}}": "",
-        "{{ROUTE}}": "", "{{UNIT_RATE}}": "", "{{TOTAL_FEE}}": "",
+        "{{FROM}}":       origin or "N/A",
+        "{{TO}}":         (destination or "N/A") + cicpa_flag,
+        "{{TRUCK_TYPE}}": truck_summary,
+        "{{GENERAL}}":    "General Cargo" if cargo_type == "general" else "",
+        "{{CHEMICAL}}":   "Chemical Load" if cargo_type == "chemical" else "",
+        "{{TRIP_TYPE}}":  trip_label_for_header,
+        "{{CICPA}}":      "Yes" if is_cicpa_city else "No",
+        "{{ROUTE}}":      route_str,
+        "{{UNIT_RATE}}":  money(subtotal),
+        "{{TOTAL_FEE}}":  money(grand_total),
     }
-    try:
-        replace_everywhere(doc, placeholders)  # uses your existing helper if present
-    except Exception:
-        pass  # If you don't have replace_everywhere, it's fine to skip
+    replace_everywhere(doc, placeholders)
 
-    # Find your quotation details table (change the detector if your headers differ)
-    try:
-        table = find_details_table(doc)  # your helper
-    except Exception:
-        table = None
-
-    if not table:
-        # Fallback: create a simple 3-col table
-        doc.add_paragraph("Quotation Details")
-        table = doc.add_table(rows=1, cols=3)
-        hdr = table.rows[0].cells
+    table = find_details_table(doc)
+    if table:
+        clear_table_body(table)
+        for desc, unit_rate, amount in per_truck_rows:
+            add_row(table, desc, unit_rate, amount)
+        gt_row = add_row(table, "GRAND TOTAL", "", f"AED {money(grand_total)}")
+        emphasize_row(gt_row, font_pt=12)
+    else:
+        doc.add_paragraph("Quotation Details (Auto)")
+        small = doc.add_table(rows=1, cols=3)
+        hdr = small.rows[0].cells
         hdr[0].text, hdr[1].text, hdr[2].text = "Item", "Unit Rate", "Amount (AED)"
+        for desc, unit_rate, amount in per_truck_rows:
+            add_row(small, desc, unit_rate, amount)
+        gt_row = add_row(small, "GRAND TOTAL", "", f"AED {money(grand_total)}")
+        emphasize_row(gt_row, font_pt=12)
 
-    # Small helpers (use your existing ones if you already have them)
-    def add_row(item, unit_rate="", amount=""):
-        row = table.add_row()
-        cells = row.cells
-        if len(cells) >= 1: cells[0].text = str(item)
-        if len(cells) >= 2: cells[1].text = str(unit_rate)
-        if len(cells) >= 3: cells[2].text = str(amount)
-        return row
-
-    def emphasize_row(row):
-        try:
-            for i, cell in enumerate(row.cells):
-                for p in cell.paragraphs:
-                    for run in p.runs:
-                        run.font.bold = True
-        except Exception:
-            pass
-
-    def money(x):
-        from decimal import Decimal, ROUND_HALF_UP
-        try:
-            d = Decimal(str(x))
-        except Exception:
-            d = Decimal("0")
-        return f"{d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}"
-
-    # You likely already have these helpers in your file:
-    # - cicpa_required_for(city)
-    # - lookup_rate(origin, destination, truck_label, cargo_type)
-    # - TRUCK_LABELS (mapping internal key -> display label)
-
-    grand_total = 0
-
-    for gi in range(groups_count):
-        origin      = (request.form.get(f"origin_{gi}") or "").strip()
-        destination = (request.form.get(f"destination_{gi}") or "").strip()
-        main_trip   = (request.form.get(f"trip_type_{gi}") or "one_way").strip().lower()
-        cargo_type  = (request.form.get(f"cargo_type_{gi}") or "general").strip().lower()
-
-        truck_types    = request.form.getlist(f"truck_type_{gi}[]") or []
-        truck_qty_list = request.form.getlist(f"truck_qty_{gi}[]") or []
-        per_row_trips  = request.form.getlist(f"trip_kind_{gi}[]") or []
-
-        # Normalize per-row trip overrides
-        def norm_trip(v):
-            v = (v or "").strip().lower()
-            return v if v in ("one_way", "back_load") else main_trip
-        per_row_trips = [norm_trip(v) for v in per_row_trips]
-
-        # Build (truck_key, qty) list using your TRUCK_LABELS map
-        chosen = []
-        for t_label, q in zip(truck_types, truck_qty_list):
-            try:
-                qty = int(float(q or "0"))
-            except:
-                qty = 0
-            if qty <= 0:
-                continue
-
-            # reverse map display label -> internal key
-            inv = {v.lower(): k for k, v in TRUCK_LABELS.items()}
-            key = inv.get((t_label or "").strip().lower())
-            if not key:
-                # fallback to your normalizer if you have one
-                try:
-                    key = norm_truck(t_label)
-                except Exception:
-                    key = None
-            if key in TRUCK_LABELS:
-                chosen.append((key, qty))
-
-        # Header for this route
-        cicpa_flag = " (CICPA)" if cicpa_required_for(destination) else " (Non-CICPA)"
-        hdr = add_row(f"— Route #{gi+1}: {origin} → {destination}{cicpa_flag}", "", "")
-        emphasize_row(hdr)
-
-        subtotal = 0
-
-        # Align trips length with chosen rows
-        row_trips = per_row_trips[:len(chosen)] + [main_trip] * max(0, len(chosen) - len(per_row_trips))
-
-        for (truck_key, qty), row_trip in zip(chosen, row_trips):
-            label = TRUCK_LABELS[truck_key]
-            is_back = (row_trip == "back_load")
-            mult = 2 if is_back else 1
-            tag = " (Back Load)" if is_back else ""
-
-            rate = lookup_rate(origin, destination, label, cargo_type)
-            if rate is None:
-                add_row(f"{label} x {qty} — No rate found for {origin} → {destination}", "", "")
-                continue
-
-            unit = rate * mult
-            amt = unit * qty
-            add_row(
-                f"{label} x {qty} — {origin} → {destination}{cicpa_flag}{tag}",
-                f"AED {money(unit)}",
-                f"AED {money(amt)}"
-            )
-            subtotal += float(amt)
-
-        # Subtotal for this route
-        srow = add_row(f"Subtotal Route #{gi+1}", "", f"AED {money(subtotal)}")
-        emphasize_row(srow)
-        grand_total += subtotal
-
-    # Grand total
-    grow = add_row("GRAND TOTAL", "", f"AED {money(grand_total)}")
-    emphasize_row(grow)
-
-    # Return the Word file
     buf = io.BytesIO()
-    doc.save(buf); buf.seek(0)
-    name = "Transport_Quotation_MultiRoute.docx" if groups_count > 1 else "Transport_Quotation.docx"
-    return send_file(buf, as_attachment=True, download_name=name)
+    doc.save(buf)
+    buf.seek(0)
+    download_name = f"Transport_Quotation_{(origin or 'Origin').replace(' ','')}To{(destination or 'Destination').replace(' ','')}.docx"
+    return send_file(buf, as_attachment=True, download_name=download_name)
+
+
 
 @app.route("/chat", methods=["POST"])
 def chat():
