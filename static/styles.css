@@ -125,6 +125,8 @@ html,body{
   font-size:1rem;
   text-align:center;
 }
+
+/* FIX: Clear button must not overlay the trip radios */
 .truck-type-row .btn-remove{
   width:100%;
   text-align:center;
@@ -136,7 +138,9 @@ html,body{
   cursor:pointer;
   padding:.5rem 0;
   border-radius:6px;
-  transform: translateY(16px);
+  transform:none;           /* was: translateY(16px) */
+  margin-top:16px;
+  position:static;
 }
 .truck-type-row .btn-remove:hover{
   color:#fff;
@@ -156,7 +160,7 @@ html,body{
 }
 .btn-add:hover{background:#e1ebff;}
 
-/* Chat toggle / box */
+/* Chat toggle / box (unchanged) */
 .chat-toggle{
   position:fixed;
   bottom:2.5rem; right:2rem;
@@ -233,7 +237,7 @@ html,body{
   }
 }
 
-/* === MULTI FROM/TO ADD-ON (append only) === */
+/* === MULTI FROM/TO ADD-ON === */
 .request-block{
   border:2px solid var(--blue-dsv);
   border-radius:12px;
@@ -254,7 +258,17 @@ html,body{
 }
 .btn-add-ft:hover{ background:#e1ebff; }
 
-/* truck row utility (non-destructive; matches your current layout) */
-.truck-type-row .qty-wrapper input[type="number"]{ width:70px; }
-.btn-remove{ padding:.5rem .8rem; border:1px solid #e0e0e0; background:#f6f6f6; border-radius:10px; cursor:pointer; }
-.btn-remove:hover{ background:#eee; }
+/* Remove From/To button look */
+.request-actions .btn-remove{
+  padding:.45rem .8rem;
+  background:#f6f6f6;
+  border:1px solid #e0e0e0;
+  color:var(--blue-dsv);
+  border-radius:999px;
+  font-weight:600;
+  cursor:pointer;
+}
+.request-actions .btn-remove:hover{ background:#eee; }
+
+/* Hide the Remove From/To on very first block */
+.request-block:first-of-type .btn-remove-block{ display:none; }
