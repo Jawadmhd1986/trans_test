@@ -89,15 +89,7 @@ html,body{
 }
 .trip-options label.selected{background:var(--blue-dsv); color:#fff;}
 
-/* -------- NEW: Route card (each From/To group) -------- */
-.route-card{
-  border:2px solid var(--blue-dsv);
-  border-radius:12px;
-  padding:1rem;
-  margin-bottom:15px;
-}
-
-/* Trip card box (inside a route) */
+/* Trip card box */
 .trip-card{
   border:2px solid var(--blue-dsv);
   border-radius:10px;
@@ -144,14 +136,12 @@ html,body{
   cursor:pointer;
   padding:.5rem 0;
   border-radius:6px;
+  transform: translateY(16px);
 }
 .truck-type-row .btn-remove:hover{
   color:#fff;
   background:var(--blue-dsv);
 }
-
-/* Buttons row (+ Add Truck Type | + Add From / To) */
-.btn-row{ display:flex; gap:.5rem; flex-wrap:wrap; margin:.5rem 0 0; }
 
 /* Add button */
 .btn-add{
@@ -223,8 +213,10 @@ html,body{
 #chat-send{background:var(--blue-dsv); color:#fff; border:none; padding:0 1rem; cursor:pointer; transition:background .2s;}
 #chat-send:hover{background:var(--blue-dsv-light);}
 
-/* Hide Clear button ONLY in the first trip of the first route */
-.route-card:first-child .trip-card:first-child .btn-remove{ display:none; }
+/* Hide Clear button in FIRST trip card only */
+.trip-card:first-child .btn-remove{
+  display:none;
+}
 
 /* Mobile tweaks */
 @media (max-width:480px){
