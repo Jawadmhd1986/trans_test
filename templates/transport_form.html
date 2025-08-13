@@ -4,117 +4,89 @@
   <meta charset="UTF-8" />
   <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Transportation Quotation</title>
-
-  <!-- Styles (keep your existing file) -->
-  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <title>DSV Transportation Quotation</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
 <body>
+  <!-- Floating DSV logo (stays outside the card) -->
+  <img src="{{ url_for('static', filename='dsv_logo.png') }}" alt="DSV Logo" class="dsv-logo" />
+
   <section class="quote-section">
-    <!-- DSV logo -->
-    <img class="dsv-logo" src="{{ url_for('static', filename='dsv_logo.png') }}" alt="DSV" />
-
-    <!-- Card -->
     <div class="quote-card">
-      <h1 class="title">Transportation Quotation</h1>
+      <h1>Transportation Quotation</h1>
 
-      <form id="quote-form" action="{{ url_for('generate_transport') }}" method="POST" novalidate>
-
-        <!-- ============ FROM / TO (MULTI-ROUTE) ============ -->
-        <div class="block">
-          <div class="block-title">From</div>
-          <div id="routes">
-            <!-- first route row -->
-            <div class="form-row route-row">
-              <div class="form-group">
-                <label>From</label>
-                <select name="origin[]" required>
-                  <option value="">— Select Pickup —</option>
-                  {% for o in origins %}
-                    <option>{{ o }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-
-              <div class="form-group">
-                <label>To</label>
-                <select name="destination[]" required>
-                  <option value="">— Select City —</option>
-                  {% for d in destinations %}
-                    <option>{{ d }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-            </div>
-          </div>
-
-          <!-- add buttons row (truck + NEW route) -->
-          <div class="btn-row">
-            <button type="button" id="add-truck" class="btn-add">+ Add Truck Type</button>
-            <button type="button" id="add-route" class="btn-add">+ Add From / To</button>
-          </div>
-        </div>
-
-        <!-- ============ TRUCK TYPES ============ -->
-        <div class="block">
-          <div class="block-title">Truck Types</div>
-
-          <!-- Trip Type (global) -->
-          <div class="trip-toggle">
-            <input type="radio" id="trip-one" name="trip_type" value="one_way" checked>
-            <label for="trip-one" class="btn-toggle">One Way</label>
-
-            <input type="radio" id="trip-back" name="trip_type" value="back_load">
-            <label for="trip-back" class="btn-toggle">Back Load</label>
-          </div>
-
-          <!-- truck rows container -->
-          <div id="trucks" class="truck-rows">
-            <div class="form-row truck-row">
-              <div class="form-group">
-                <label>Type</label>
-                <select name="truck_type[]" required>
-                  <option value="">— Select Truck Type —</option>
-                  {% for key, label in truck_labels.items() %}
-                    <option value="{{ label }}">{{ label }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-
-              <div class="form-group">
-                <label>QTY</label>
-                <input type="number" name="truck_qty[]" min="1" step="1" value="1" required>
-              </div>
-
-              <!-- (optional) per-row trip kind, aligns with backend if present -->
-              <input type="hidden" name="trip_kind[]" value="">
-            </div>
-          </div>
-        </div>
-
-        <!-- ============ CARGO TYPE ============ -->
-        <div class="block">
-          <div class="block-title">Cargo Type</div>
+      <form id="quote-form" action="{{ url_for('generate_transport') }}" method="POST">
+        <!-- From / To -->
+        <div id="routes">
+<div class="form-row">
           <div class="form-group">
-            <select name="cargo_type">
-              <option value="general" selected>General Cargo</option>
-              <option value="chemical">Chemical Load</option>
+            <label for="origin">From</label>
+            <select id="origin" name="origin[]" required>
+              <option value="">— Select Pickup —</option>
+              {% for o in origins %}
+                <option>{{ o }}</option>
+              {% endfor %}
             </select>
           </div>
+
+          <div class="form-group">
+            <label for="destination">To</label>
+            <select id="destination" name="destination[]" required>
+              <option value="">— Select City —</option>
+              {% for d in destinations %}
+                <option>{{ d }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div></div>
+
+        <!-- Trip Type (will be moved INSIDE the first box by JS) -->
+        <div id="tripTypeGroup" class="form-group">
+          <label>Trip Type</label>
+          <div class="trip-options">
+            <label class="selected">
+              <input type="radio" name="trip_type" value="one_way" checked />
+              <span>One Way</span>
+            </label>
+            <label>
+              <input type="radio" name="trip_type" value="back_load" />
+              <span>Back Load</span>
+            </label>
+          </div>
         </div>
 
-        <!-- SUBMIT -->
-        <div class="actions">
-          <button class="btn-primary" type="submit">Generate</button>
+        <!-- Truck Types heading + cards container -->
+        <div class="form-group">
+          <label>Truck Types</label>
+
+          <!-- JS will create boxes (.trip-card) inside here -->
+          <div id="truckTypeContainer"></div>
+
+          <button type="button" id="add-truck-type" class="btn-add">+ Add Truck Type</button>
+
+          <button type="button" id="add-route" class="btn-add">+ Add From / To</button>
+
         </div>
+
+        <!-- Cargo Type -->
+        <div class="form-group">
+          <label for="cargo_type">Cargo Type</label>
+          <select id="cargo_type" name="cargo_type" required>
+            <option value="general">General Cargo</option>
+            <option value="chemical">Chemical Load</option>
+          </select>
+        </div>
+
+        <button class="btn-primary" type="submit">Generate</button>
       </form>
     </div>
 
-    <!-- Floating chat button & window (unchanged assets) -->
+    <!-- Chat toggle -->
     <button class="chat-toggle" type="button" aria-label="Open chat">
       <img src="{{ url_for('static', filename='chat-icon.png') }}" alt="" />
     </button>
 
+    <!-- Chat window -->
     <div class="chat-window" id="chatWin" aria-live="polite" hidden>
       <div class="chat-header">
         <div class="chat-title">
@@ -124,7 +96,9 @@
         <button id="chat-close" type="button" title="Close">✕</button>
       </div>
 
-      <div class="chat-body" id="chat-box"></div>
+      <div class="chat-body" id="chat-box">
+        <div id="chat-messages"></div>
+      </div>
 
       <div class="chat-footer">
         <input id="chat-input" type="text" placeholder="Type a message..." />
@@ -133,7 +107,13 @@
     </div>
   </section>
 
-  <!-- Scripts (keep your existing file) -->
-  <script defer src="{{ url_for('static', filename='chatbot.js') }}"></script>
+  <!-- Globals for JS -->
+  <script>
+    window.TRUCK_TYPES  = {{ truck_types|tojson }};
+    window.CICPA_CITIES = {{ cicpa_cities|tojson }};
+    window.LOCAL_TRUCKS = {{ local_trucks|tojson }};
+    window.CICPA_TRUCKS = {{ cicpa_trucks|tojson }};
+  </script>
+  <script src="{{ url_for('static', filename='chatbot.js') }}"></script>
 </body>
 </html>
