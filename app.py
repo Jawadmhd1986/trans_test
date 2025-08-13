@@ -454,8 +454,6 @@ def generate_transport():
     download_name = f"Transport_Quotation_{(origin or 'Origin').replace(' ','')}To{(destination or 'Destination').replace(' ','')}.docx"
     return send_file(buf, as_attachment=True, download_name=download_name)
 
-
-
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json()
@@ -757,7 +755,7 @@ def chat():
         return jsonify({"reply": "Open Shed storage is 1.8 AED/CBM/day. Standard VAS applies."})
 
     # --- Chemical Storage Follow-ups ---
-    if match([r"^chemical$", r"chemical storage only"]):
+    if match([r"^chemical$", r"^chemicals$", r"chemicals storage only", r"chemical storage only"]):
         return jsonify({"reply": "Do you mean Chemical AC or Chemical Non-AC?"})
 
     if match([r"chemical ac", r"ac chemical", r"chemical ac storage", r"chemical ac storage rate", r"^chemical ac$"]):
@@ -988,6 +986,15 @@ def chat():
             "4️⃣ Reporting/system integration needs\n"
             "5️⃣ Any relocation, retrieval, or disposal cycles"
         })
+    if match([r"^rfid$", r"what is rfid", r"rfid meaning", r"rfid technology"]):
+        return jsonify({"reply":
+        "**RFID** stands for *Radio Frequency Identification*. It’s a technology that uses radio waves to automatically identify and track tags attached to objects.\n\n"
+        "At **DSV Abu Dhabi**, RFID is used for:\n"
+        "- Asset tracking and management\n"
+        "- Warehouse inventory visibility\n"
+        "- Automated gate control and access logging\n\n"
+        "RFID tags can be passive (no battery) or active (battery-powered) and can be scanned without direct line of sight."
+    })
 
     if match([r"asset management", r"what is asset management", r"tracking of assets", r"rfid.*asset"]):
         return jsonify({"reply":
@@ -1024,7 +1031,7 @@ def chat():
         })
 
     if match([
-        r"pallet positions", r"how many.*pallet.*position", r"pallet slots",
+        r"pallet positions", r"pallet position", r"how many.*pallet.*position", r"pallet slots",
         r"positions per bay", r"rack.*pallet.*position", r"warehouse pallet capacity"
     ]):
         return jsonify({"reply":
@@ -1093,7 +1100,10 @@ def chat():
 
     if match([r"chambers.*21k", r"how many.*chambers", r"warehouse.*layout", r"wh.*layout", r"warehouse.*structure", r"\bchambers\b"]):
         return jsonify({"reply": "There are 7 chambers in the 21K warehouse with different sizes and rack types. Chambers range from 1,000–5,000 sqm and together can accommodate ~35,000 CBM."})
-
+    if match([r"packing material", r"what packing material", r"materials used for packing"]):
+            return jsonify({"reply":
+            "DSV uses high-grade packing materials:\n- Shrink wrap (6 rolls per box, 1 roll = 20 pallets)\n- Strapping rolls + buckle kits (1 roll = 20 pallets)\n- Bubble wrap, carton boxes, foam sheets\n- Heavy-duty pallets (wooden/plastic)\nUsed for relocation, storage, and export."
+        })
     if match([
         r"warehouse activities", r"inbound process", r"outbound process", r"wh process",
         r"warehouse process", r"SOP", r"operation process", r"putaway", r"replenishment",
@@ -1294,10 +1304,16 @@ def chat():
             "Yes, DSV supports **cross-docking** for fast-moving cargo:\n- Receive → Sort → Dispatch (no storage)\n- Ideal for FMCG, e-commerce, and retail\n- Reduces lead time and handling\n- Available at Mussafah and KIZAD hubs"
         })
 
-    if match([r"transit store", r"transit warehouse", r"transit storage", r"temporary storage", r"short term storage"]):
+    if match([
+    r"transit\b", r"transit store", r"transit warehouse", r"transit storage", 
+    r"temporary storage", r"short term storage"]):
         return jsonify({"reply":
-            "DSV offers **transit storage** for short-term cargo holding. Ideal for:\n- Customs-cleared goods awaiting dispatch\n- Re-export shipments\n- Short-duration contracts\nOptions available in Mussafah, Airport Freezone, and KIZAD."
-        })
+        "DSV offers **transit storage** for short-term cargo holding. Ideal for:\n"
+        "- Customs-cleared goods awaiting dispatch\n"
+        "- Re-export shipments\n"
+        "- Short-duration contracts\n"
+        "Options available in Mussafah, Airport Freezone, and KIZAD."
+    })
 
     # --- EV trucks ---
     if match([r"ev truck|electric vehicle|zero emission|sustainable transport"]):
@@ -1352,28 +1368,34 @@ def chat():
             "We handle 2PL, 3PL, 4PL logistics, WMS, VAS, and temperature-controlled storage. Contact +971 2 555 2900 or visit dsv.com."
         })
 # --- General Logistics Overview ---
-    if match([
-    r"\blogistics\b",
-    r"what.*is.*logistics",
-    r"about logistics",
-    r"logistics info",
-    r"tell me about logistics",
-    r"explain logistics",
-    r"what do you know about logistics",
-    r"logistics overview",
-    r"define logistics",
-    r"logistics meaning"
-]):
-        return jsonify({"reply":
-        "**Logistics** refers to the planning, execution, and management of the movement and storage of goods, services, and information from origin to destination.\n\n"
-        "At **DSV Abu Dhabi**, logistics includes:\n"
-        "- 📦 **Warehousing** – AC, Non-AC, Open Yard, and temperature-controlled facilities\n"
-        "- 🚛 **Transportation** – Local & GCC trucking (flatbeds, reefers, lowbeds, box trucks, double trailers, etc.)\n"
-        "- 🧾 **Value Added Services** – Packing, labeling, inventory counts, kitting & assembly\n"
-        "- 🌍 **Global Freight Forwarding** – Air, sea, and multimodal shipments\n"
-        "- 🧠 **4PL & Supply Chain Solutions** – End-to-end management, optimization, and consulting\n\n"
-        "We manage everything from port-to-door, ensuring safety, compliance, and cost efficiency."
-    })
+    if (
+        match([
+        r"\blogistics\b",
+        r"what.*is.*logistics",
+        r"about logistics",
+        r"logistics info",
+        r"tell me about logistics",
+        r"explain logistics",
+        r"what do you know about logistics",
+        r"logistics overview",
+        r"define logistics",
+        r"logistics meaning"
+    ])
+    # don't trigger if user is asking about 1PL/2PL/3PL/3.5PL/4PL/5PL/6PL
+        and not re.search(
+        r"\b(1|2|3|3\.5|4|5|6)pl\b|\b(first|second|third|fourth|fifth|sixth)\s+party\s+logistics\b",
+        message
+    )
+):
+        return jsonify({"reply": """**Logistics** refers to the planning, execution, and management of the movement and storage of goods, services, and information from origin to destination.
+At **DSV Abu Dhabi**, logistics includes:
+- 📦 **Warehousing** – AC, Non-AC, Open Yard, and temperature-controlled facilities
+- 🚛 **Transportation** – Local & GCC trucking (flatbeds, reefers, lowbeds, box trucks, double trailers, etc.)
+- 🧾 **Value Added Services** – Packing, labeling, inventory counts, kitting & assembly
+- 🌍 **Global Freight Forwarding** – Air, sea, and multimodal shipments
+- 🧠 **4PL & Supply Chain Solutions** – End-to-end management, optimization, and consulting
+We manage everything from port-to-door, ensuring safety, compliance, and cost efficiency."""})
+
 
     # --- DSV Vision / Mission ---
     if match([
@@ -1392,7 +1414,7 @@ def chat():
             "Visit dsv.com to learn more about our global goals and ESG initiatives."
         })
 
-    if not re.search(r"(wms|warehouse management|abu dhabi|fleet|transport|vision|mission|location|address|site)", message) and match([
+    if not re.search(r"(wms|warehouse management|abu dhabi|fleet|transport|vision|mission|location|address|site|service)", message) and match([
         r"\bdsv\b", r"about dsv", r"who is dsv", r"what is dsv",
         r"dsv info", r"tell me about dsv", r"dsv overview",
         r"dsv abbreviation", r"dsv stands for", r"what does dsv mean"
@@ -1439,11 +1461,6 @@ def chat():
             "DSV provides **kitting and assembly** as a Value Added Service:\n- Combine multiple SKUs into kits\n- Light assembly of components\n- Repacking and labeling\n- Ideal for retail, pharma, and project logistics"
         })
 
-    if match([r"packing material", r"what packing material", r"materials used for packing"]):
-        return jsonify({"reply":
-            "DSV uses high-grade packing materials:\n- Shrink wrap (6 rolls per box, 1 roll = 20 pallets)\n- Strapping rolls + buckle kits (1 roll = 20 pallets)\n- Bubble wrap, carton boxes, foam sheets\n- Heavy-duty pallets (wooden/plastic)\nUsed for relocation, storage, and export."
-        })
-
     if match([r"\brelocation\b", r"move warehouse", r"shift cargo", r"site relocation"]):
         return jsonify({"reply":
             "Yes, DSV provides full **relocation services**:\n- Machinery shifting\n- Office and warehouse relocations\n- Packing, transport, offloading\n- Insurance and dismantling available\nHandled by our trained team with all safety measures."
@@ -1481,9 +1498,6 @@ def chat():
 
     if match([r"warehouse activities|warehouse tasks|daily warehouse work"]):
         return jsonify({"reply": "DSV warehouse activities include receiving (inbound), put-away, storage, replenishment, order picking, packing, staging, and outbound dispatch. We also handle inventory audits, cycle counts, and VAS."})
-
-    if match([r"warehouse process|inbound|outbound|putaway|replenishment|dispatch"]):
-        return jsonify({"reply": "Typical warehouse processes at DSV: (1) Inbound receiving, (2) Put-away into racks or zones, (3) Order picking or replenishment, (4) Packing & labeling, (5) Outbound dispatch. All steps are WMS-tracked."})
 
     if match([r"\bsop\b", r"standard operating procedure", r"standard operation process"]):
         return jsonify({"reply":
@@ -1579,6 +1593,98 @@ def chat():
 
     if match([r"proposal|quotation|offer|quote.*open yard|proposal.*open yard|send me.*quote|how to get quote|need.*quotation"]):
         return jsonify({"reply": "To get a full quotation, please close this chat and fill the details in the main form on the left. The system will generate a downloadable document for you."})
+
+    # ===== Compare only requested PLs (1PL/2PL/3PL/3.5PL/4PL/5PL/6PL) =====
+    # ===== Compare only requested PLs (1PL/2PL/3PL/3.5PL/4PL/5PL/6PL) =====
+    def _extract_pl_mentions(msg: str):
+        aliases = {
+            "1PL": [r"\b1pl\b", r"\bfirst party logistics\b"],
+            "2PL": [r"\b2pl\b", r"\bsecond party logistics\b"],
+            "3PL": [r"\b3pl\b", r"\bthird party logistics\b"],
+            "3.5PL": [r"\b3\.?5pl\b", r"\bthree and half pl\b", r"\b3pl plus\b", r"\bmiddle of 3pl and 4pl\b"],
+            "4PL": [r"\b4pl\b", r"\bfourth party logistics\b"],
+            "5PL": [r"\b5pl\b", r"\bfifth party logistics\b"],
+            "6PL": [r"\b6pl\b", r"\bsixth party logistics\b"],
+        }
+        found = []
+        for code, pats in aliases.items():
+            pos = None
+            for p in pats:
+                m = re.search(p, msg)
+                if m:
+                    pos = m.start() if pos is None else min(pos, m.start())
+            if pos is not None:
+                found.append((code, pos))
+        found.sort(key=lambda x: x[1])
+        ordered = []
+        for code, _ in found:
+            if code not in ordered:
+                ordered.append(code)
+        return ordered
+
+    _PL_DEF = {
+        "1PL": {"title": "1PL — First-Party Logistics", "bullets": [
+            "Owner of goods does everything in-house (warehouse, trucks, staff, systems).",
+            "Max control, but higher CAPEX/OPEX and expertise needed."
+        ]},
+        "2PL": {"title": "2PL — Second-Party Logistics", "bullets": [
+            "Asset/capacity provider (trucks, space, vessels). Client still runs operations.",
+            "You rent capacity; processes and planning stay with you."
+        ]},
+        "3PL": {"title": "3PL — Third-Party Logistics", "bullets": [
+            "Outsourced execution: warehousing, transport, order fulfillment, VAS.",
+            "Provider runs ops under your strategy/KPIs; WMS/TMS operated by provider."
+        ]},
+        "3.5PL": {"title": "3.5PL — Hybrid (between 3PL & 4PL)", "bullets": [
+            "Provider handles operations + some planning/analytics/CI.",
+            "More orchestration than 3PL, not a full lead-logistics role."
+        ]},
+        "4PL": {"title": "4PL — Fourth-Party Logistics", "bullets": [
+            "Lead logistics integrator managing multiple 3PLs/carriers, network design, and strategy.",
+            "Single point of contact; end-to-end governance and optimization."
+        ]},
+        "5PL": {"title": "5PL — Fifth-Party Logistics", "bullets": [
+            "Orchestrates networks-of-networks via platforms; heavy data & automation.",
+            "Outcome-based management across several 3PL/4PL providers."
+        ]},
+        "6PL": {"title": "6PL — Sixth-Party Logistics (emerging)", "bullets": [
+            "AI-driven/autonomous orchestration (digital twins, predictive planning, autonomous assets).",
+            "Vision/early adoption rather than a widely standardised operating model."
+        ]},
+    }
+
+    def _short_contrast(pls):
+        order = ["1PL","2PL","3PL","3.5PL","4PL","5PL","6PL"]
+        rank = {k:i for i,k in enumerate(order)}
+        pls_sorted = sorted(pls, key=lambda k: rank.get(k, 99))
+        parts = []
+        for k in pls_sorted:
+            if k == "1PL": parts.append("client in-house")
+            elif k == "2PL": parts.append("provider assets only")
+            elif k == "3PL": parts.append("provider runs execution")
+            elif k == "3.5PL": parts.append("exec + some strategy")
+            elif k == "4PL": parts.append("lead-logistics orchestration")
+            elif k == "5PL": parts.append("platform multi-network")
+            elif k == "6PL": parts.append("autonomous/AI orchestration")
+        return " → ".join(parts)
+
+    # Compare ONLY requested PLs
+    if (
+        re.search(r"\b(vs|versus|difference|different|compare|comparison|diff)\b", message)
+        and len(_extract_pl_mentions(message)) >= 2
+    ):
+        asked = _extract_pl_mentions(message)
+        lines = ["**Comparison — " + " vs ".join(asked) + "**\n"]
+        for code in asked:
+            d = _PL_DEF.get(code)
+            if not d:
+                continue
+            lines.append(f"🔹 **{d['title']}**")
+            for b in d["bullets"]:
+                lines.append(f"- {b}")
+            lines.append("")
+        lines.append(f"**In short:** {_short_contrast(asked)}.")
+        return jsonify({"reply": "\n".join(lines)})
 
     # --- Service definitions ---
     if match([r"\bwhat is 2pl\b", r"\b2pl\b", r"second party logistics", r"2pl meaning"]):
