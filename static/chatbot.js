@@ -143,7 +143,6 @@ document.addEventListener('DOMContentLoaded', () => {
     `;
 
     if (index === 0) {
-      // First row follows the main trip (hidden input)
       const hidden = document.createElement('input');
       hidden.type  = 'hidden';
       hidden.name  = 'trip_kind[]';
@@ -151,7 +150,6 @@ document.addEventListener('DOMContentLoaded', () => {
       hidden.value = getGlobalTrip();
       row.appendChild(hidden);
     } else {
-      // Additional rows get their own visible trip selector
       const tripBlock = document.createElement('div');
       tripBlock.className = 'select-wrapper';
       tripBlock.style.gridColumn = '1 / span 3';
@@ -181,15 +179,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const firstCard = cards[0];
     if (!firstCard) return;
 
-    // Ensure the first card has NO visible per-row trip selector and has hidden input synced
     const firstRow = firstCard.querySelector('.truck-type-row');
     if (!firstRow) return;
 
-    // remove any visible select in first card
     const sel = firstRow.querySelector('select[name="trip_kind[]"]');
     if (sel) sel.closest('.select-wrapper')?.remove();
 
-    // ensure hidden trip input exists and is synced
     let hidden = firstRow.querySelector('input.trip-kind-hidden[name="trip_kind[]"]');
     if (!hidden) {
       hidden = document.createElement('input');
@@ -201,30 +196,23 @@ document.addEventListener('DOMContentLoaded', () => {
     hidden.value = getGlobalTrip();
   }
 
-  // ---------- Initialize: build FIRST card with Trip Type + first row ----------
+  // ---------- Initialize: first card with Trip Type + first row ----------
   if (truckTypeContainer && addTruckTypeBtn) {
-    // Create first card and move the existing Trip Type group into it
     const firstCard = makeCard();
-    // Move the Trip Type group (label + buttons) into the first card
     if (tripTypeGroup) firstCard.appendChild(tripTypeGroup);
-
-    // Add the first truck row
     firstCard.appendChild(createTruckRow(0));
     truckTypeContainer.appendChild(firstCard);
 
-    // Add-row button → new card with its own row (and visible per-row Trip Type select)
     addTruckTypeBtn.addEventListener('click', () => {
-      const idx = truckTypeContainer.querySelectorAll('.trip-card').length; // next index
+      const idx = truckTypeContainer.querySelectorAll('.trip-card').length;
       const card = makeCard();
       card.appendChild(createTruckRow(idx));
       truckTypeContainer.appendChild(card);
-      // focus new row trip selector if available
       const tripSel = card.querySelector('select[name="trip_kind[]"]');
       if (tripSel) tripSel.focus();
     });
   }
 
-  // Re-filter truck types when destination changes
   if (destEl) {
     destEl.addEventListener('change', () => {
       const allowed = truckListForCity(currentCity());
@@ -235,6 +223,5 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Keep first row synced with main radio on load
   normalizeFirstRowUI();
 });
