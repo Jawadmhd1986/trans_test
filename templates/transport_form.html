@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
 <body>
-  <!-- Floating DSV logo (stays outside the card) -->
+  <!-- Floating DSV logo -->
   <img src="{{ url_for('static', filename='dsv_logo.png') }}" alt="DSV Logo" class="dsv-logo" />
 
   <section class="quote-section">
@@ -16,7 +16,7 @@
       <h1>Transportation Quotation</h1>
 
       <form action="{{ url_for('generate_transport') }}" method="POST" id="transportForm">
-        <!-- From / To -->
+        <!-- Top From / To (unchanged) -->
         <div class="form-row">
           <div class="form-group">
             <label for="origin">From</label>
@@ -27,7 +27,6 @@
               {% endfor %}
             </select>
           </div>
-
           <div class="form-group">
             <label for="destination">To</label>
             <select id="destination" name="destination" required>
@@ -39,37 +38,53 @@
           </div>
         </div>
 
-        <!-- Trip Type -->
-        <div id="tripTypeGroup" class="form-group">
-          <label>Trip Type</label>
-          <div class="trip-options">
-            <label class="selected">
-              <input type="radio" name="trip_type" value="one_way" checked />
-              <span>One Way</span>
-            </label>
-            <label>
-              <input type="radio" name="trip_type" value="back_load" />
-              <span>Back Load</span>
-            </label>
+        <!-- Main route block (as you already have) -->
+        <div id="routeBlocks">
+          <div class="group-box route-block" data-route-index="0">
+            <div class="group-title">Truck Types</div>
+
+            <!-- Trip Type pills for main -->
+            <div class="form-group">
+              <label>Trip Type</label>
+              <div class="trip-options" data-trip>
+                <label class="selected">
+                  <input type="radio" name="trip_type" value="one_way" checked />
+                  <span>One Way</span>
+                </label>
+                <label>
+                  <input type="radio" name="trip_type" value="back_load" />
+                  <span>Back Load</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- First truck row -->
+            <div class="group-row trucks" data-trucks>
+              <div class="form-group">
+                <label class="tiny">Type</label>
+                <select name="truck_type_0[]" class="truck-type" required>
+                  <option value="">— Select Truck Type —</option>
+                  {% for t in truck_types %}
+                    <option value="{{ t }}">{{ t }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="form-group" style="max-width:120px;">
+                <label class="tiny">QTY</label>
+                <input type="number" name="truck_qty_0[]" class="truck-qty" min="1" step="1" value="1" />
+              </div>
+              <button type="button" class="btn-remove" data-role="remove-truck">Clear</button>
+            </div>
           </div>
         </div>
 
-        <!-- Truck Types heading + cards container -->
-        <div class="form-group">
-          <label>Truck Types</label>
-
-          <!-- Your JS (if any) can still create boxes here -->
-          <div id="truckTypeContainer"></div>
-
-          <!-- Buttons row -->
+        <!-- Buttons row (unchanged labels) -->
+        <div id="buttonsRow" style="margin-top:.5rem;">
           <button type="button" id="add-truck-type" class="btn-add">+ Add Truck Type</button>
           <button type="button" id="btnAddRoute" class="btn-add">+ Add From / To</button>
-
-          <!-- Inserted route blocks appear immediately below this anchor -->
-          <div id="routeBlocksAnchor"></div>
         </div>
 
-        <!-- Cargo Type -->
+        <!-- Cargo Type (unchanged) -->
         <div class="form-group">
           <label for="cargo_type">Cargo Type</label>
           <select id="cargo_type" name="cargo_type" required>
@@ -113,57 +128,197 @@
   <!-- Your chatbot JS (unchanged) -->
   <script src="{{ url_for('static', filename='chatbot.js') }}"></script>
 
-  <!-- Template for the mini route block (hidden) -->
+  <!-- Templates for rows/blocks -->
+  <template id="truckRowTpl">
+    <div class="group-row">
+      <div class="form-group">
+        <label class="tiny">Type</label>
+        <select class="truck-type" required>
+          <option value="">— Select Truck Type —</option>
+          {% for t in truck_types %}
+            <option value="{{ t }}">{{ t }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-group" style="max-width:120px;">
+        <label class="tiny">QTY</label>
+        <input type="number" class="truck-qty" min="1" step="1" value="1" />
+      </div>
+      <button type="button" class="btn-remove" data-role="remove-truck">Clear</button>
+    </div>
+  </template>
+
+  <!-- Route block template WITH its own From/To and Trip Type pills (no "(Use main)") -->
   <template id="routeBlockTpl">
     <div class="group-box route-block">
-      <div class="group-row">
+      <!-- From / To for this added route -->
+      <div class="form-row" data-route-fromto>
+        <div class="form-group">
+          <label class="tiny">From</label>
+          <select class="route-origin" required>
+            <option value="">— Select Pickup —</option>
+            {% for o in origins %}
+              <option>{{ o }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="tiny">To</label>
+          <select class="route-destination" required>
+            <option value="">— Select City —</option>
+            {% for d in destinations %}
+              <option>{{ d }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+
+      <div class="group-title">Truck Types</div>
+
+      <!-- Trip Type pills (same as main) -->
+      <div class="form-group">
+        <label>Trip Type</label>
+        <div class="trip-options" data-trip>
+          <label class="selected">
+            <input type="radio" value="one_way" checked />
+            <span>One Way</span>
+          </label>
+          <label>
+            <input type="radio" value="back_load" />
+            <span>Back Load</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- One default truck row -->
+      <div class="group-row trucks" data-trucks>
         <div class="form-group">
           <label class="tiny">Type</label>
-          <select name="truck_type[]" class="truck-type" required>
+          <select class="truck-type" required>
             <option value="">— Select Truck Type —</option>
             {% for t in truck_types %}
               <option value="{{ t }}">{{ t }}</option>
             {% endfor %}
           </select>
         </div>
-
         <div class="form-group" style="max-width:120px;">
           <label class="tiny">QTY</label>
-          <input type="number" name="truck_qty[]" class="truck-qty" min="1" step="1" value="1" />
+          <input type="number" class="truck-qty" min="1" step="1" value="1" />
         </div>
-
-        <button type="button" class="btn-remove" data-role="route-clear">Clear</button>
+        <button type="button" class="btn-remove" data-role="remove-truck">Clear</button>
       </div>
 
-      <div class="form-group" style="margin-top:.5rem;">
-        <label class="tiny">Trip Type</label>
-        <select name="trip_kind[]" class="trip-kind">
-          <option value="">(Use main)</option>
-          <option value="one_way">One Way</option>
-          <option value="back_load">Back Load</option>
-        </select>
+      <!-- Per-block actions -->
+      <div class="form-row" style="gap:.5rem; margin-top:.5rem;">
+        <button type="button" class="btn-add" data-role="add-truck">+ Add Truck Type</button>
+        <button type="button" class="btn-remove" data-role="remove-route">Clear</button>
       </div>
     </div>
   </template>
 
-  <!-- Minimal script to drop the block directly under the buttons -->
+  <!-- Minimal JS: main Add Truck, Add From/To (full boxed block with From/To + Trip pills) -->
   <script>
   (function () {
-    const addBtn   = document.getElementById('btnAddRoute');
-    const tpl      = document.getElementById('routeBlockTpl');
-    const anchor   = document.getElementById('routeBlocksAnchor');
-    if (!addBtn || !tpl || !anchor) return;
+    const routeBlocks = document.getElementById('routeBlocks');
+    const addRouteBtn = document.getElementById('btnAddRoute');
+    const buttonsRow  = document.getElementById('buttonsRow');
+    const truckRowTpl = document.getElementById('truckRowTpl');
+    const routeTpl    = document.getElementById('routeBlockTpl');
+    if (!routeBlocks || !addRouteBtn || !buttonsRow || !truckRowTpl || !routeTpl) return;
 
-    function wireBlock(block) {
-      const clr = block.querySelector('[data-role="route-clear"]');
-      if (clr) clr.addEventListener('click', () => block.remove());
+    // Trip pill selector toggle (adds/removes .selected on labels)
+    function wireTripPills(container) {
+      const labels = Array.from(container.querySelectorAll('label'));
+      labels.forEach(lbl => {
+        const input = lbl.querySelector('input[type="radio"]');
+        if (!input) return;
+        input.addEventListener('change', () => {
+          labels.forEach(l => l.classList.remove('selected'));
+          lbl.classList.add('selected');
+        });
+      });
     }
 
-    addBtn.addEventListener('click', () => {
-      const node = tpl.content.firstElementChild.cloneNode(true);
-      wireBlock(node);
-      // Insert block right under the two buttons (at the anchor)
-      anchor.insertAdjacentElement('afterend', node);
+    // Wire one truck row's Clear
+    function wireTruckRow(row) {
+      const rm = row.querySelector('[data-role="remove-truck"]');
+      if (rm) rm.addEventListener('click', () => row.remove());
+    }
+
+    // Set distinct names for added route block to avoid touching your backend for the main route
+    function setNamesForBlock(block, idx) {
+      // From/To for this route
+      const o = block.querySelector('.route-origin');
+      const d = block.querySelector('.route-destination');
+      if (o) o.name = `origin_${idx}`;
+      if (d) d.name = `destination_${idx}`;
+
+      // Trip type pills (radio group name)
+      const trip = block.querySelector('[data-trip]');
+      if (trip) {
+        trip.querySelectorAll('input[type="radio"]').forEach(r => r.name = `trip_type_${idx}`);
+      }
+
+      // Truck rows
+      block.querySelectorAll('.truck-type').forEach(el => el.name = `truck_type_${idx}[]`);
+      block.querySelectorAll('.truck-qty').forEach(el => el.name = `truck_qty_${idx}[]`);
+    }
+
+    // Wire a route block
+    function wireRouteBlock(block, idx) {
+      setNamesForBlock(block, idx);
+
+      // Trip pills styling
+      const tripWrap = block.querySelector('[data-trip]');
+      if (tripWrap) wireTripPills(tripWrap);
+
+      // Add-truck inside this block
+      const trucksWrap = block.querySelector('[data-trucks]');
+      const addTruckBtn = block.querySelector('[data-role="add-truck"]');
+      if (addTruckBtn && trucksWrap) {
+        addTruckBtn.addEventListener('click', () => {
+          const row = truckRowTpl.content.firstElementChild.cloneNode(true);
+          row.querySelector('.truck-type').name = `truck_type_${idx}[]`;
+          row.querySelector('.truck-qty').name  = `truck_qty_${idx}[]`;
+          wireTruckRow(row);
+          trucksWrap.insertAdjacentElement('beforeend', row);
+        });
+      }
+
+      // Clear truck rows
+      block.querySelectorAll('[data-role="remove-truck"]').forEach(wireTruckRow);
+
+      // Remove the whole added route
+      const rmRoute = block.querySelector('[data-role="remove-route"]');
+      if (rmRoute) rmRoute.addEventListener('click', () => block.remove());
+    }
+
+    // Wire trip pills in main block so visuals stay in sync
+    const mainTrip = document.querySelector('.route-block[data-route-index="0"] [data-trip]');
+    if (mainTrip) wireTripPills(mainTrip);
+
+    // Main "+ Add Truck Type" adds to first block only (index 0)
+    (function wireMainAddTruck() {
+      const mainAddBtn = document.getElementById('add-truck-type');
+      const mainBlock  = routeBlocks.querySelector('.route-block[data-route-index="0"]');
+      if (!mainAddBtn || !mainBlock) return;
+      const trucksWrap = mainBlock.querySelector('[data-trucks]');
+
+      mainAddBtn.addEventListener('click', () => {
+        const row = truckRowTpl.content.firstElementChild.cloneNode(true);
+        row.querySelector('.truck-type').name = 'truck_type_0[]';
+        row.querySelector('.truck-qty').name  = 'truck_qty_0[]';
+        wireTruckRow(row);
+        trucksWrap.insertAdjacentElement('beforeend', row);
+      });
+    })();
+
+    // "+ Add From / To" → insert full boxed route (with its own From/To + Trip pills) ABOVE buttons row
+    let routeIdx = 1; // main is 0
+    addRouteBtn.addEventListener('click', () => {
+      const node = routeTpl.content.firstElementChild.cloneNode(true);
+      wireRouteBlock(node, routeIdx++);
+      buttonsRow.insertAdjacentElement('beforebegin', node);
     });
   })();
   </script>
