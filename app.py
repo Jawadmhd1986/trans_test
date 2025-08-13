@@ -453,7 +453,138 @@ def generate_transport():
     buf.seek(0)
     download_name = f"Transport_Quotation_{(origin or 'Origin').replace(' ','')}To{(destination or 'Destination').replace(' ','')}.docx"
     return send_file(buf, as_attachment=True, download_name=download_name)
+# ========= MULTI FROM/TO QUOTATION ROUTE =========
+from decimal import Decimal as DEC
+from flask import request, jsonify, send_file
+from docx import Document
+from datetime import datetime
+import io, os
 
+def _money(x: DEC) -> str:
+    return f"{x:.2f}"
+
+def _find_details_table(doc: Document):
+    for t in doc.tables:
+        # assume first row has 3 cells with headers
+        if len(t.rows) and len(t.rows[0].cells) >= 3:
+            return t
+    return None
+
+def _clear_table_body(t):
+    while len(t.rows) > 1:
+        t._tbl.remove(t.rows[1]._tr)
+
+def _add_row(t, c1, c2, c3):
+    r = t.add_row().cells
+    r[0].text = str(c1); r[1].text = str(c2); r[2].text = str(c3)
+
+def _lookup_rate(origin, destination, truck_label, cargo_type):
+    """
+    Uses your EXISTING rate lookup if available.
+    If you already have `lookup_rate(...)` defined elsewhere in app.py,
+    you can simply `return lookup_rate(origin, destination, truck_label, cargo_type)`.
+    """
+    try:
+        # call your existing function if present:
+        return lookup_rate(origin, destination, truck_label, cargo_type)  # type: ignore
+    except NameError:
+        # fallback demo values (replace if needed)
+        base = DEC("500.00")
+        if origin.lower() == "mussafah" and destination.lower() == "dubai":
+            base = DEC("950.00")
+        if "back" in truck_label.lower():
+            base += DEC("150.00")
+        return base
+
+def _is_cicpa(city: str) -> bool:
+    try:
+        return bool(cicpa_required_for(city))  # type: ignore
+    except NameError:
+        # simple heuristic fallback
+        return city.strip().lower() in {"ruwais", "das", "zirku", "umm al dalkh", "islands"}
+
+def _compute_rows(origin, destination, main_trip, cargo_type, trucks):
+    rows, subtotal = [], DEC("0")
+    cicpa_tag = " (CICPA)" if _is_cicpa(destination) else " (Non-CICPA)"
+    for item in trucks:
+        label = (item.get("label") or "").strip()
+        qty = int(float(item.get("qty") or 0))
+        trip = (item.get("trip_kind") or main_trip).strip().lower()
+        if not label or qty <= 0:
+            continue
+        way_mult = DEC("2.00") if trip == "back_load" else DEC("1.00")
+        unit = DEC(_lookup_rate(origin, destination, label, cargo_type))
+        per_truck = unit * way_mult
+        total = per_truck * qty
+        trip_tag = " (Back Load)" if trip == "back_load" else ""
+        rows.append((
+            f"{label} x {qty} — {origin} → {destination}{cicpa_tag}{trip_tag}",
+            f"AED {_money(per_truck)}",
+            f"AED {_money(total)}"
+        ))
+        subtotal += total
+    return rows, subtotal
+
+@app.route("/generate_transport_multi", methods=["POST"])
+def generate_transport_multi():
+    data = request.get_json(silent=True) or {}
+    cargo_type = (data.get("cargo_type") or "general").strip().lower()
+    reqs = data.get("requests") or []
+    if not reqs:
+        return jsonify({"error":"No requests provided."}), 400
+
+    tpl = os.path.join("templates", "TransportQuotation.docx")
+    if not os.path.exists(tpl):
+        return jsonify({"error":"TransportQuotation.docx not found in templates/"}), 500
+
+    doc = Document(tpl)
+
+    # Replace common placeholders (safe no-ops if not found)
+    today = datetime.today().strftime("%d %b %Y")
+    replace_everywhere(doc, {
+        "{{TODAY_DATE}}": today,
+        "{{FROM}}": "Multiple",
+        "{{TO}}": "Multiple",
+        "{{TRUCK_TYPE}}": "Multiple selections",
+        "{{GENERAL}}": "General Cargo" if cargo_type == "general" else "",
+        "{{CHEMICAL}}": "Chemical Load" if cargo_type == "chemical" else "",
+        "{{TRIP_TYPE}}": "Mixed",
+        "{{CICPA}}": "Mixed",
+        "{{ROUTE}}": "Multiple routes",
+        "{{UNIT_RATE}}": "",
+        "{{TOTAL_FEE}}": "",
+})
+
+    table = _find_details_table(doc)
+    if not table:
+        doc.add_paragraph("Quotation Details")
+        table = doc.add_table(rows=1, cols=3)
+        hdr = table.rows[0].cells
+        hdr[0].text, hdr[1].text, hdr[2].text = "Item", "Unit Rate", "Amount (AED)"
+    _clear_table_body(table)
+
+    grand = DEC("0")
+    for i, r in enumerate(reqs, start=1):
+        origin = (r.get("origin") or "").strip()
+        destination = (r.get("destination") or "").strip()
+        main_trip = (r.get("main_trip") or "one_way").strip().lower()
+        trucks = r.get("trucks") or []
+        _add_row(table, f"Route {i}: {origin} → {destination}", "", "")
+        rows, sub = _compute_rows(origin, destination, main_trip, cargo_type, trucks)
+        if not rows:
+            _add_row(table, "(No valid trucks for this route)", "", "")
+        else:
+            for d, u, a in rows:
+                _add_row(table, d, u, a)
+        _add_row(table, f"Subtotal (Route {i})", "", f"AED {_money(sub)}")
+        grand += sub
+
+    _add_row(table, "GRAND TOTAL", "", f"AED {_money(grand)}")
+
+    buf = io.BytesIO()
+    doc.save(buf); buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name="Transport_Quotation_Multi.docx")
+# ======== END MULTI FROM/TO ROUTE ========
 
 @app.route("/chat", methods=["POST"])
 def chat():
