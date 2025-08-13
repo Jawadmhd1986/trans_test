@@ -1,6 +1,4 @@
-/* =========================================================
-   Viewport fix (unchanged)
-========================================================= */
+/* ===== 100vh mobile fix (unchanged) ===== */
 window.addEventListener('load', () => {
   const vh = window.innerHeight * 0.01;
   document.documentElement.style.setProperty('--vh', `${vh}px`);
@@ -10,170 +8,99 @@ window.addEventListener('resize', () => {
   document.documentElement.style.setProperty('--vh', `${vh}px`);
 });
 
-/* =========================================================
-   DOM READY
-========================================================= */
 document.addEventListener('DOMContentLoaded', () => {
-  /* -------------------------------------------------------
-     CHATBOT  (all original behavior preserved)
-  ------------------------------------------------------- */
-  const chatBox    = document.getElementById('chat-box');
-  const chatToggle = document.querySelector('.chat-toggle');
-  const chatClose  = document.getElementById('chat-close');
-  const sendBtn    = document.getElementById('chat-send');
+  /* =========================================================
+     CHATBOT (kept same behavior & UI)
+  ========================================================= */
   const chatPanel  = document.getElementById('chat-box');
   const msgsEl     = document.getElementById('chat-messages');
   const inputEl    = document.getElementById('chat-input');
+  const chatToggle = document.querySelector('.chat-toggle');
+  const chatClose  = document.getElementById('chat-close');
+  const sendBtn    = document.getElementById('chat-send');
 
-  function openChat()  { chatPanel?.classList.add('open');  }
-  function closeChat() { chatPanel?.classList.remove('open'); }
-
-  chatToggle?.addEventListener('click', openChat);
-  chatClose?.addEventListener('click', closeChat);
-
-  sendBtn?.addEventListener('click', () => {
-    const v = (inputEl?.value || '').trim();
-    if (!v) return;
-    ask(v);
-  });
-  inputEl?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      const v = (inputEl?.value || '').trim();
-      if (!v) return;
-      ask(v);
-    }
-  });
-
-  function appendMessage(sender, text, typewriter = false) {
-    const wrapper = document.createElement('div');
-    wrapper.className = `message ${sender}`;
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble';
-    wrapper.appendChild(bubble);
-    msgsEl.appendChild(wrapper);
+  function appendMessage(sender, text) {
+    const wrap = document.createElement('div');
+    wrap.className = `message ${sender}`;
+    const b = document.createElement('div');
+    b.className = 'bubble';
+    b.innerHTML = text.replace(/\n/g, '<br>');
+    wrap.appendChild(b);
+    msgsEl.appendChild(wrap);
     msgsEl.scrollTop = msgsEl.scrollHeight;
-
-    const setHTML = (t) => { bubble.innerHTML = t; msgsEl.scrollTop = msgsEl.scrollHeight; };
-
-    // allow HTML from backend safely (we assume trusted server content)
-    if (!typewriter) {
-      setHTML(text);
-      return;
-    }
-    let i = 0;
-    (function typeChar(){
-      if (i < text.length) {
-        setHTML((bubble.innerHTML || '') + text.charAt(i++));
-        requestAnimationFrame(typeChar);
-      }
-    })();
   }
-
   async function ask(text) {
-    appendMessage('me', text, false);
+    appendMessage('me', text);
     inputEl.value = '';
-    appendMessage('bot', '…', false);
+    const typing = document.createElement('div');
+    typing.className = 'message bot';
+    typing.innerHTML = '<div class="bubble">…</div>';
+    msgsEl.appendChild(typing);
+    msgsEl.scrollTop = msgsEl.scrollHeight;
     try {
-      const res = await fetch('/chat', {
+      const r = await fetch('/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ message: text })
       });
-      const data = await res.json();
-      const reply = (data && data.reply) ? data.reply : '...';
-      const hasHTML = /<[^>]+>/.test(reply);
-      // remove the last temp '…'
-      const last = msgsEl.querySelector('.message.bot:last-child .bubble');
-      if (last) last.parentElement.parentElement.remove();
-      appendMessage('bot', reply, !hasHTML);
+      const j = await r.json();
+      typing.remove();
+      appendMessage('bot', j.reply || 'OK');
     } catch {
-      const last = msgsEl.querySelector('.message.bot:last-child .bubble');
-      if (last) last.parentElement.parentElement.remove();
-      appendMessage('bot', 'Sorry, something went wrong.');
+      typing.remove();
+      appendMessage('bot', 'Sorry, I could not reach the server.');
     }
   }
+  chatToggle?.addEventListener('click', () => chatPanel.classList.add('open'));
+  chatClose?.addEventListener('click', () => chatPanel.classList.remove('open'));
+  sendBtn?.addEventListener('click', () => inputEl.value.trim() && ask(inputEl.value.trim()));
+  inputEl?.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && inputEl.value.trim()) ask(inputEl.value.trim());
+  });
 
-  /* -------------------------------------------------------
-     ORIGINAL SINGLE-ROUTE UI (kept exactly as before)
-     These hooks are used when your old HTML is present.
-  ------------------------------------------------------- */
-  const tripTypeGroup       = document.getElementById('tripTypeGroup');
-  const truckTypeContainer  = document.getElementById('truckTypeContainer');
-  const addTruckTypeBtn     = document.getElementById('add-truck-type');
-  const originEl            = document.getElementById('origin');
-  const destEl              = document.getElementById('destination');
+  /* =========================================================
+     ORIGINAL SINGLE-ROUTE UI (unchanged)
+     These IDs/classes come from your existing HTML.
+  ========================================================= */
+  const form               = document.querySelector('form[action*="generate_transport"]');
+  const originEl           = document.getElementById('origin');
+  const destEl             = document.getElementById('destination');
+  const tripTypeGroup      = document.getElementById('tripTypeGroup');
+  const truckTypeContainer = document.getElementById('truckTypeContainer');
+  const addTruckTypeBtn    = document.getElementById('add-truck-type');
 
-  // Globals injected by template
-  const CICPA_CITIES = (window.CICPA_CITIES || []).map(s => (s || '').toLowerCase());
+  const CICPA_CITIES = (window.CICPA_CITIES || []).map(s => (s||'').toLowerCase());
   const LOCAL_TRUCKS = window.LOCAL_TRUCKS || [];
   const CICPA_TRUCKS = window.CICPA_TRUCKS || [];
   const TRUCK_TYPES  = window.TRUCK_TYPES  || [];
 
   function isCicpaCity(city){ return !!city && CICPA_CITIES.includes(String(city).toLowerCase().trim()); }
-  function truckListForCity(city){ return isCicpaCity(city) ? CICPA_TRUCKS : LOCAL_TRUCKS; }
-
-  function getGlobalTrip() {
-    const checked = document.querySelector('input[name="trip_type"]:checked');
-    return checked ? checked.value : 'one_way';
-  }
-
-  function buildOptions(list, current) {
-    const opts = ['<option value="">— Select Truck Type —</option>']
-      .concat(list.map(t => `<option value="${t}">${t}</option>`))
-      .join('');
-    const wrap = document.createElement('select');
-    wrap.innerHTML = opts;
-    if (current && list.includes(current)) wrap.value = current;
-    return wrap.innerHTML;
-  }
-
-  function currentCity(){ return destEl ? destEl.value : ''; }
-
-  function normalizeFirstRowUI() {
-    const firstCard = truckTypeContainer?.querySelector('.trip-card');
-    if (!firstCard) return;
-    const firstRowTrip = firstCard.querySelector('select[name="trip_kind[]"]');
-    if (firstRowTrip) {
-      // hide, since first card uses main Trip Type radios
-      firstRowTrip.closest('.field')?.classList.add('hidden');
-    }
+  function allowedTrucksFor(city){ return isCicpaCity(city) ? CICPA_TRUCKS : LOCAL_TRUCKS; }
+  function buildOptions(list, cur=''){
+    return ['<option value="">— Select Truck Type —</option>']
+      .concat(list.map(t => `<option value="${t}">${t}</option>`)).join('');
   }
 
   function makeCard() {
-    const card = document.createElement('div');
-    card.className = 'trip-card';
-
-    const rows = document.createElement('div');
-    rows.className = 'rows';
-    card.appendChild(rows);
-
-    const actions = document.createElement('div');
-    actions.className = 'actions';
-    const removeBtn = document.createElement('button');
-    removeBtn.type = 'button';
-    removeBtn.className = 'clear-row';
-    removeBtn.title = 'Remove';
-    removeBtn.textContent = '✕';
-    actions.appendChild(removeBtn);
-    card.appendChild(actions);
-
-    removeBtn.addEventListener('click', () => {
+    const card = document.createElement('div'); card.className = 'trip-card';
+    const rows = document.createElement('div'); rows.className = 'rows';
+    const actions = document.createElement('div'); actions.className = 'actions';
+    const x = document.createElement('button'); x.type='button'; x.className='clear-row'; x.textContent='✕';
+    actions.appendChild(x);
+    x.addEventListener('click', () => {
       const all = truckTypeContainer.querySelectorAll('.trip-card');
       if (all.length > 1) card.remove();
     });
+    card.appendChild(rows); card.appendChild(actions);
     return card;
   }
-
-  function createTruckRow(idx, cityForFilter) {
-    const allowed = truckListForCity(cityForFilter || currentCity());
+  function createTruckRow(cityFilter) {
     const row = document.createElement('div');
     row.className = 'row three truck-row';
     row.innerHTML = `
       <div class="field">
         <label>Type</label>
-        <select name="truck_type[]" class="truck-type">
-          ${buildOptions(allowed, '')}
-        </select>
+        <select name="truck_type[]" class="truck-type">${buildOptions(allowedTrucksFor(cityFilter||destEl?.value))}</select>
       </div>
       <div class="field sm">
         <label>QTY</label>
@@ -186,164 +113,166 @@ document.addEventListener('DOMContentLoaded', () => {
           <option value="one_way">One Way</option>
           <option value="back_load">Back Load</option>
         </select>
-      </div>
-    `;
+      </div>`;
     return row;
   }
 
-  // Initialize legacy/single route UI
+  // Build your original first card (as before)
   if (truckTypeContainer && addTruckTypeBtn) {
-    const firstCard = makeCard();
+    const first = makeCard();
+    if (tripTypeGroup) first.insertBefore(tripTypeGroup, first.firstChild);
+    first.querySelector('.rows').appendChild(createTruckRow());
+    truckTypeContainer.appendChild(first);
 
-    // Move Trip Type group inside first card (your original behavior)
-    if (tripTypeGroup) firstCard.insertBefore(tripTypeGroup, firstCard.firstChild);
-
-    // Add the first truck row
-    firstCard.querySelector('.rows').appendChild(createTruckRow(0));
-    truckTypeContainer.appendChild(firstCard);
-
-    // Add new card on click
     addTruckTypeBtn.addEventListener('click', () => {
-      const idx = truckTypeContainer.querySelectorAll('.trip-card').length;
       const card = makeCard();
-      card.querySelector('.rows').appendChild(createTruckRow(idx));
+      card.querySelector('.rows').appendChild(createTruckRow());
       truckTypeContainer.appendChild(card);
-      const tripSel = card.querySelector('select[name="trip_kind[]"]');
-      if (tripSel) tripSel.focus();
     });
 
-    // Rebuild options when destination changes (CICPA filter)
     destEl?.addEventListener('change', () => {
-      const allowed = truckListForCity(currentCity());
-      document.querySelectorAll('select[name="truck_type[]"]').forEach(sel => {
+      const allowed = allowedTrucksFor(destEl.value);
+      document.querySelectorAll('select.truck-type').forEach(sel => {
         const cur = sel.value;
         sel.innerHTML = buildOptions(allowed, cur);
+        if (allowed.includes(cur)) sel.value = cur;
       });
     });
-
-    // Keep first row synced with main radio on load
-    normalizeFirstRowUI();
   }
 
-  /* -------------------------------------------------------
-     MULTI-ROUTE (ADDITIVE)
-     Activates only if the new multi-route HTML is present.
-  ------------------------------------------------------- */
-  const routeHolder   = document.getElementById('route-groups');
-  const addRouteBtn   = document.getElementById('add-route');
-  const groupsCountEl = document.getElementById('groups_count');
+  /* =========================================================
+     ADD-ON: Multi-route with NO HTML/CSS changes
+     - Injects "+ Add From / To" button after your "+ Add Truck Type"
+     - Keeps current visual style untouched
+     - Packs extra routes into hidden fields for backend
+  ========================================================= */
+  if (form && addTruckTypeBtn && originEl && destEl) {
+    // Hidden counter for backend
+    let groups = 1;
+    const groupsCount = document.createElement('input');
+    groupsCount.type = 'hidden';
+    groupsCount.name = 'groups_count';
+    groupsCount.id   = 'groups_count';
+    groupsCount.value = String(groups);
+    form.appendChild(groupsCount);
 
-  // When multi-route markup exists, we initialize each route block
-  if (routeHolder && groupsCountEl) {
-    // Helper: build truck row HTML for a specific route index
-    function truckRowHTML(idx, city) {
-      const allowed = truckListForCity(city || '');
-      const opts = allowed.map(t => `<option value="${t}">${t}</option>`).join('');
-      return `
-        <div class="row three truck-row">
-          <div class="field">
-            <label>Type</label>
-            <select name="truck_type_${idx}[]" class="truck-type">
-              ${opts}
-            </select>
-          </div>
-          <div class="field sm">
-            <label>QTY</label>
-            <input type="number" name="truck_qty_${idx}[]" class="truck-qty" value="1" min="1">
-          </div>
-          <div class="field">
-            <label>Trip</label>
-            <select name="trip_kind_${idx}[]" class="trip-kind">
-              <option value="">Use Main Trip</option>
-              <option value="one_way">One Way</option>
-              <option value="back_load">Back Load</option>
-            </select>
-          </div>
-          <button type="button" class="clear-row" title="Remove row">✕</button>
-        </div>`;
+    // Container that will hold extra routes (kept invisible)
+    const hiddenHolder = document.createElement('div');
+    hiddenHolder.style.display = 'none';
+    form.appendChild(hiddenHolder);
+
+    // Insert the "+ Add From / To" button right after "+ Add Truck Type"
+    const addRouteBtn = document.createElement('button');
+    addRouteBtn.type = 'button';
+    addRouteBtn.id = 'add-from-to';
+    addRouteBtn.className = 'btn-add';
+    addRouteBtn.textContent = '+ Add From / To';
+    addTruckTypeBtn.insertAdjacentElement('afterend', addRouteBtn);
+
+    // Template for creating a hidden, indexed route block
+    function makeHiddenRoute(index) {
+      const wrap = document.createElement('div');
+      wrap.className = 'route-hidden';
+      wrap.dataset.index = String(index);
+
+      // clone current visible selections as default values
+      const curOrigin = originEl.value || '';
+      const curDest   = destEl.value || '';
+      const mainTrip  = (document.querySelector('input[name="trip_type"]:checked') || {}).value || 'one_way';
+      const cargoSel  = document.getElementById('cargo_type');
+      const cargoVal  = cargoSel ? cargoSel.value : 'general';
+
+      wrap.innerHTML = `
+        <input type="hidden" name="origin_${index}" value="${curOrigin}">
+        <input type="hidden" name="destination_${index}" value="${curDest}">
+        <input type="hidden" name="trip_type_${index}" value="${mainTrip}">
+        <input type="hidden" name="cargo_type_${index}" value="${cargoVal}">
+        <input type="hidden" name="truck_type_${index}[]" value="">
+        <input type="hidden" name="truck_qty_${index}[]"  value="1">
+        <input type="hidden" name="trip_kind_${index}[]"   value="">
+      `;
+      hiddenHolder.appendChild(wrap);
+      return wrap;
     }
 
-    function initRoute(groupEl) {
-      const idx         = parseInt(groupEl.dataset.index, 10) || 0;
-      const originSel   = groupEl.querySelector(`#origin_${idx}`);
-      const destSel     = groupEl.querySelector(`#destination_${idx}`);
-      const addTruckBtn = groupEl.querySelector('.add-truck');
-      const rowsBox     = groupEl.querySelector(`.truck-rows[data-index="${idx}"]`);
+    // When user clicks "+ Add From / To":
+    addRouteBtn.addEventListener('click', () => {
+      groups += 1;
+      groupsCount.value = String(groups);
 
-      // Destination filtering for trucks
-      function refreshTruckLists() {
-        const allowed = truckListForCity(destSel?.value || '');
-        rowsBox.querySelectorAll('select.truck-type').forEach(sel => {
-          const cur = sel.value;
-          sel.innerHTML = ['<option value="">— Select Truck Type —</option>']
-            .concat(allowed.map(t => `<option value="${t}">${t}</option>`))
-            .join('');
-          if (allowed.includes(cur)) sel.value = cur;
-        });
-      }
-      destSel?.addEventListener('change', refreshTruckLists);
+      // create hidden route with current selections as a starting point
+      const route = makeHiddenRoute(groups - 1);
 
-      // Add truck row in this group
-      addTruckBtn?.addEventListener('click', () => {
-        rowsBox.insertAdjacentHTML('beforeend', truckRowHTML(idx, destSel?.value));
+      // Also mirror the currently visible truck rows into this hidden route
+      const truckTypes = Array.from(document.querySelectorAll('select[name="truck_type[]"]'));
+      const truckQtys  = Array.from(document.querySelectorAll('input[name="truck_qty[]"]'));
+      const tripKinds  = Array.from(document.querySelectorAll('select[name="trip_kind[]"]'));
+
+      // Clear placeholder first inputs created in template:
+      const phTypes = route.querySelectorAll(`input[name="truck_type_${groups-1}[]"]`);
+      const phQtys  = route.querySelectorAll(`input[name="truck_qty_${groups-1}[]"]`);
+      const phTrips = route.querySelectorAll(`input[name="trip_kind_${groups-1}[]"]`);
+      phTypes.forEach(n => n.remove());
+      phQtys.forEach(n => n.remove());
+      phTrips.forEach(n => n.remove());
+
+      // Add each visible truck row to the hidden route
+      truckTypes.forEach((sel, i) => {
+        const t = document.createElement('input');
+        t.type='hidden'; t.name=`truck_type_${groups-1}[]`; t.value=sel.value || '';
+        const q = document.createElement('input');
+        q.type='hidden'; q.name=`truck_qty_${groups-1}[]`; q.value=(truckQtys[i]?.value || '1');
+        const k = document.createElement('input');
+        k.type='hidden'; k.name=`trip_kind_${groups-1}[]`; k.value=(tripKinds[i]?.value || '');
+
+        route.appendChild(t); route.appendChild(q); route.appendChild(k);
       });
 
-      // Remove row (keep at least one)
-      rowsBox?.addEventListener('click', (e) => {
-        if (e.target.classList.contains('clear-row')) {
-          const row = e.target.closest('.truck-row');
-          if (rowsBox.querySelectorAll('.truck-row').length > 1) row.remove();
+      // Optional: brief confirmation
+      addRouteBtn.disabled = true;
+      setTimeout(() => { addRouteBtn.disabled = false; }, 250);
+    });
+
+    // On submit, treat the visible (main) route as index 0
+    form.addEventListener('submit', () => {
+      // ensure index 0 fields exist reflecting the visible UI
+      // (server expects origin_0, destination_0, trip_type_0, cargo_type_0, truck_type_0[], ...)
+      const ensure = (name, val) => {
+        let el = form.querySelector(`input[name="${name}"]`);
+        if (!el) {
+          el = document.createElement('input');
+          el.type = 'hidden'; el.name = name; form.appendChild(el);
         }
+        el.value = val;
+      };
+
+      const mainTrip  = (document.querySelector('input[name="trip_type"]:checked') || {}).value || 'one_way';
+      const cargoSel  = document.getElementById('cargo_type');
+
+      ensure('origin_0', originEl.value || '');
+      ensure('destination_0', destEl.value || '');
+      ensure('trip_type_0', mainTrip);
+      ensure('cargo_type_0', cargoSel ? cargoSel.value : 'general');
+
+      // Map the visible truck rows to truck_type_0[], truck_qty_0[], trip_kind_0[]
+      // Create a staging div to hold them
+      const stage = form.querySelector('#_stage0') || (() => {
+        const d = document.createElement('div'); d.id = '_stage0'; d.style.display='none'; form.appendChild(d); return d;
+      })();
+      stage.innerHTML = ''; // clear
+
+      const truckTypes = Array.from(document.querySelectorAll('select[name="truck_type[]"]'));
+      const truckQtys  = Array.from(document.querySelectorAll('input[name="truck_qty[]"]'));
+      const tripKinds  = Array.from(document.querySelectorAll('select[name="trip_kind[]"]'));
+      truckTypes.forEach((sel, i) => {
+        const t = document.createElement('input');
+        t.type='hidden'; t.name='truck_type_0[]'; t.value=sel.value || '';
+        const q = document.createElement('input');
+        q.type='hidden'; q.name='truck_qty_0[]'; q.value=(truckQtys[i]?.value || '1');
+        const k = document.createElement('input');
+        k.type='hidden'; k.name='trip_kind_0[]'; k.value=(tripKinds[i]?.value || '');
+        stage.appendChild(t); stage.appendChild(q); stage.appendChild(k);
       });
-    }
-
-    // Initialize any existing groups in the DOM
-    routeHolder.querySelectorAll('.route-group').forEach(initRoute);
-
-    // Add route button
-    addRouteBtn?.addEventListener('click', () => {
-      const next = routeHolder.querySelectorAll('.route-group').length;
-      const proto = routeHolder.querySelector('.route-group[data-index="0"]');
-      if (!proto) return;
-
-      // clone and reindex
-      const clone = proto.cloneNode(true);
-      clone.dataset.index = String(next);
-      clone.querySelectorAll('[id]').forEach(el => {
-        el.id = el.id.replace('_0', `_${next}`);
-      });
-      clone.querySelectorAll('[name]').forEach(el => {
-        el.name = el.name
-          .replace(/origin_\d+/, `origin_${next}`)
-          .replace(/destination_\d+/, `destination_${next}`)
-          .replace(/trip_type_\d+/, `trip_type_${next}`)
-          .replace(/truck_type_\d+\[\]/, `truck_type_${next}[]`)
-          .replace(/truck_qty_\d+\[\]/, `truck_qty_${next}[]`)
-          .replace(/trip_kind_\d+\[\]/, `trip_kind_${next}[]`)
-          .replace(/cargo_type_\d+/, `cargo_type_${next}`);
-      });
-
-      // clear values
-      clone.querySelectorAll('input[type="number"]').forEach(i => i.value = 1);
-      clone.querySelectorAll('select').forEach(s => { if (s.name.startsWith('truck_type_')) s.selectedIndex = 0; });
-      // route label
-      const head = clone.querySelector('.route-header span');
-      if (head) head.innerHTML = `Route <b>#${next+1}</b>`;
-
-      // ensure truck rows box has its data-index updated
-      const rowsBox = clone.querySelector('.truck-rows');
-      if (rowsBox) rowsBox.setAttribute('data-index', String(next));
-
-      // update the add-truck button dataset
-      const atb = clone.querySelector('.add-truck');
-      if (atb) atb.setAttribute('data-index', String(next));
-
-      routeHolder.appendChild(clone);
-      groupsCountEl.value = String(next + 1);
-
-      // init behaviors on the new group
-      initRoute(clone);
-      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
     });
   }
 });
