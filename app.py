@@ -454,6 +454,7 @@ def generate_transport():
     download_name = f"Transport_Quotation_{(origin or 'Origin').replace(' ','')}To{(destination or 'Destination').replace(' ','')}.docx"
     return send_file(buf, as_attachment=True, download_name=download_name)
 
+
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json()
