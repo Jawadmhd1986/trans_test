@@ -15,13 +15,12 @@
     <div class="quote-card">
       <h1>Transportation Quotation</h1>
 
-      <form id="quote-form" action="{{ url_for('generate_transport') }}" method="POST">
+      <form action="{{ url_for('generate_transport') }}" method="POST">
         <!-- From / To -->
-        <div id="routes">
-<div class="form-row">
+        <div class="form-row">
           <div class="form-group">
             <label for="origin">From</label>
-            <select id="origin" name="origin[]" required>
+            <select id="origin" name="origin" required>
               <option value="">— Select Pickup —</option>
               {% for o in origins %}
                 <option>{{ o }}</option>
@@ -31,14 +30,14 @@
 
           <div class="form-group">
             <label for="destination">To</label>
-            <select id="destination" name="destination[]" required>
+            <select id="destination" name="destination" required>
               <option value="">— Select City —</option>
               {% for d in destinations %}
                 <option>{{ d }}</option>
               {% endfor %}
             </select>
           </div>
-        </div></div>
+        </div>
 
         <!-- Trip Type (will be moved INSIDE the first box by JS) -->
         <div id="tripTypeGroup" class="form-group">
@@ -63,9 +62,6 @@
           <div id="truckTypeContainer"></div>
 
           <button type="button" id="add-truck-type" class="btn-add">+ Add Truck Type</button>
-
-          <button type="button" id="add-route" class="btn-add">+ Add From / To</button>
-
         </div>
 
         <!-- Cargo Type -->
@@ -74,38 +70,32 @@
           <select id="cargo_type" name="cargo_type" required>
             <option value="general">General Cargo</option>
             <option value="chemical">Chemical Load</option>
+            <option value="container">Container</option>
           </select>
         </div>
 
-        <button class="btn-primary" type="submit">Generate</button>
+        <button type="submit" class="btn-generate">Generate</button>
       </form>
     </div>
-
-    <!-- Chat toggle -->
-    <button class="chat-toggle" type="button" aria-label="Open chat">
-      <img src="{{ url_for('static', filename='chat-icon.png') }}" alt="" />
-    </button>
-
-    <!-- Chat window -->
-    <div class="chat-window" id="chatWin" aria-live="polite" hidden>
-      <div class="chat-header">
-        <div class="chat-title">
-          <span class="logo"></span>
-          <span>DSV Chat</span>
-        </div>
-        <button id="chat-close" type="button" title="Close">✕</button>
-      </div>
-
-      <div class="chat-body" id="chat-box">
-        <div id="chat-messages"></div>
-      </div>
-
-      <div class="chat-footer">
-        <input id="chat-input" type="text" placeholder="Type a message..." />
-        <button id="chat-send" type="button">Send</button>
-      </div>
-    </div>
   </section>
+
+  <!-- Chat toggle -->
+  <button class="chat-toggle" aria-label="Chat with DSV">
+    <img src="{{ url_for('static', filename='chat-icon.png') }}" alt="Chat" />
+  </button>
+
+  <!-- Chat box -->
+  <div id="chat-box" class="chat-box" aria-live="polite">
+    <div class="chat-header">
+      <span>DSV Assistant</span>
+      <button id="chat-close" title="Close chat">×</button>
+    </div>
+    <div id="chat-messages" class="chat-messages"></div>
+    <div class="chat-footer">
+      <input type="text" id="chat-input" placeholder="Type a message…" />
+      <button id="chat-send" type="button">Send</button>
+    </div>
+  </div>
 
   <!-- Globals for JS -->
   <script>
