@@ -15,17 +15,40 @@ document.addEventListener('DOMContentLoaded', () => {
   const chatClose  = document.getElementById('chat-close');
   const sendBtn    = document.getElementById('chat-send');
   const inputEl    = document.getElementById('chat-input');
-  const chatWin    = document.getElementById('chatWin');
   const msgsEl     = document.getElementById('chat-messages');
 
-  function openChat(){
-    chatWin.hidden = false;
-    inputEl.focus();
+  if (chatToggle && chatBox && chatClose && sendBtn && inputEl && msgsEl) {
+    chatToggle.addEventListener('click', () => chatBox.classList.toggle('open'));
+    chatClose.addEventListener('click', () => chatBox.classList.remove('open'));
+    sendBtn.addEventListener('click', sendMessage);
+    inputEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
   }
-  function closeChat(){ chatWin.hidden = true; }
 
-  if (chatToggle) chatToggle.addEventListener('click', openChat);
-  if (chatClose)  chatClose.addEventListener('click', closeChat);
+  async function sendMessage() {
+    const text = inputEl.value.trim();
+    if (!text) return;
+    appendMessage('user', text);
+    inputEl.value = '';
+
+    try {
+      const res = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text })
+      });
+      const data = await res.json();
+      const reply = (data && data.reply) ? data.reply : '...';
+      const hasHTML = /<[^>]+>/.test(reply);
+      appendMessage('bot', reply, !hasHTML);
+    } catch {
+      appendMessage('bot', 'Sorry, something went wrong.');
+    }
+  }
 
   function appendMessage(sender, text, typewriter = false) {
     const wrapper = document.createElement('div');
@@ -44,43 +67,28 @@ document.addEventListener('DOMContentLoaded', () => {
         if (i < text.length) {
           bubble.innerHTML += text.charAt(i++);
           msgsEl.scrollTop = msgsEl.scrollHeight;
-          requestAnimationFrame(typeChar);
+          setTimeout(typeChar, 15);
         }
       })();
     }
   }
 
-  async function sendMessage() {
-    const text = (inputEl.value || '').trim();
-    if (!text) return;
-    inputEl.value = '';
-    appendMessage('user', text);
+  // ---------------- Transport UI ----------------
 
-    try {
-      const res = await fetch('/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text })
-      });
-      const data = await res.json();
-      const reply = (data && data.reply) ? data.reply : '...';
-      const hasHTML = /<[^>]+>/.test(reply);
-      appendMessage('bot', reply, !hasHTML);
-    } catch {
-      appendMessage('bot', 'Sorry, something went wrong.');
-    }
-  }
-
-  if (sendBtn) sendBtn.addEventListener('click', sendMessage);
-  if (inputEl) inputEl.addEventListener('keydown', e => {
-    if (e.key === 'Enter') sendMessage();
-  });
-
-  // ---------------- Trip UI (existing) ----------------
   const truckTypeContainer = document.getElementById('truckTypeContainer');
   const addTruckTypeBtn    = document.getElementById('add-truck-type');
   const destEl             = document.getElementById('destination');
-  const tripTypeGroup      = document.getElementById('tripTypeGroup');
+  const tripTypeGroup      = document.getElementById('tripTypeGroup'); // contains label + .trip-options
+
+  // Main trip toggle (top of form)
+  const tripRadios = document.querySelectorAll('input[name="trip_type"]');
+  tripRadios.forEach(radio => {
+    radio.addEventListener('change', () => {
+      document.querySelectorAll('.trip-options label').forEach(l => l.classList.remove('selected'));
+      const label = radio.closest('label'); if (label) label.classList.add('selected');
+      normalizeFirstRowUI();
+    });
+  });
 
   function getGlobalTrip() {
     const checked = document.querySelector('input[name="trip_type"]:checked');
@@ -113,83 +121,29 @@ document.addEventListener('DOMContentLoaded', () => {
     return card;
   }
 
-  function normalizeFirstRowUI() {
-    const allRows = document.querySelectorAll('.truck-row');
-    allRows.forEach((row, idx) => {
-      const hidden = row.querySelector('.trip-kind-hidden');
-      const inline = row.querySelector('.trip-kind-inline');
-      if (idx === 0) {
-        // first row gets the hidden input synced to main radio
-        if (inline) inline.remove();
-        if (!hidden) {
-          const h = document.createElement('input');
-          h.type = 'hidden';
-          h.name = 'trip_kind[]';
-          h.className = 'trip-kind-hidden';
-          row.appendChild(h);
-        }
-        const hEl = row.querySelector('.trip-kind-hidden');
-        if (hEl) hEl.value = getGlobalTrip();
-      } else {
-        // other rows get an inline select
-        if (hidden) hidden.remove();
-        if (!inline) {
-          const div = document.createElement('div');
-          div.className = 'trip-kind-inline';
-          div.innerHTML = `
-            <label class="inline-label">Trip Type</label>
-            <select name="trip_kind[]" required>
-              <option value="one_way">One Way</option>
-              <option value="back_load">Back Load</option>
-            </select>`;
-          row.appendChild(div);
-        }
-        const sel = row.querySelector('.trip-kind-inline select');
-        if (sel) sel.value = getGlobalTrip();
-      }
-    });
-  }
-
-  function createTruckRow(index) {
+  function createTruckRow(index /* 0-based */) {
     const row = document.createElement('div');
-    row.className = 'form-row truck-row';
+    row.className = 'truck-type-row';
 
-    // Truck type select (filtered by CICPA)
-    const typeWrap = document.createElement('div');
-    typeWrap.className = 'form-group';
-    typeWrap.innerHTML = `
-      <label>Type</label>
-      <select name="truck_type[]" required>
-        ${buildOptions(truckListForCity(currentCity()))}
-      </select>`;
-    row.appendChild(typeWrap);
+    const allowed = truckListForCity(currentCity());
+    const options = buildOptions(allowed, null);
 
-    // Qty
-    const qtyWrap = document.createElement('div');
-    qtyWrap.className = 'form-group';
-    qtyWrap.innerHTML = `
-      <label>QTY</label>
-      <input type="number" name="truck_qty[]" min="1" step="1" value="1" required>`;
-    row.appendChild(qtyWrap);
+    row.innerHTML = `
+      <div class="select-wrapper">
+        <label class="inline-label">Type</label>
+        <select name="truck_type[]" required>${options}</select>
+      </div>
 
-    // Remove row button
-    const rm = document.createElement('button');
-    rm.type = 'button';
-    rm.className = 'btn-remove';
-    rm.textContent = 'Remove';
-    rm.addEventListener('click', () => {
-      const parentCard = row.closest('.trip-card');
-      row.remove();
-      // if the card is empty (no .truck-row), remove it
-      if (parentCard && parentCard.querySelectorAll('.truck-row').length === 0) {
-        parentCard.remove();
-      }
-      normalizeFirstRowUI();
-    });
-    row.appendChild(rm);
+      <div class="qty-wrapper">
+        <label class="inline-label">QTY</label>
+        <input type="number" name="truck_qty[]" min="1" value="1" required />
+      </div>
 
-    // first row => hidden input that mirrors global trip
+      <button type="button" class="btn-remove" title="Remove Truck Type">Clear</button>
+    `;
+
     if (index === 0) {
+      // First row follows the main trip (hidden input)
       const hidden = document.createElement('input');
       hidden.type  = 'hidden';
       hidden.name  = 'trip_kind[]';
@@ -222,10 +176,30 @@ document.addEventListener('DOMContentLoaded', () => {
     return row;
   }
 
-  // Global trip radios affect first row hidden input & default for others
-  document.querySelectorAll('input[name="trip_type"]').forEach(r => {
-    r.addEventListener('change', normalizeFirstRowUI);
-  });
+  function normalizeFirstRowUI() {
+    const cards = [...truckTypeContainer.querySelectorAll('.trip-card')];
+    const firstCard = cards[0];
+    if (!firstCard) return;
+
+    // Ensure the first card has NO visible per-row trip selector and has hidden input synced
+    const firstRow = firstCard.querySelector('.truck-type-row');
+    if (!firstRow) return;
+
+    // remove any visible select in first card
+    const sel = firstRow.querySelector('select[name="trip_kind[]"]');
+    if (sel) sel.closest('.select-wrapper')?.remove();
+
+    // ensure hidden trip input exists and is synced
+    let hidden = firstRow.querySelector('input.trip-kind-hidden[name="trip_kind[]"]');
+    if (!hidden) {
+      hidden = document.createElement('input');
+      hidden.type = 'hidden';
+      hidden.name = 'trip_kind[]';
+      hidden.className = 'trip-kind-hidden';
+      firstRow.appendChild(hidden);
+    }
+    hidden.value = getGlobalTrip();
+  }
 
   // ---------- Initialize: build FIRST card with Trip Type + first row ----------
   if (truckTypeContainer && addTruckTypeBtn) {
@@ -263,33 +237,4 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Keep first row synced with main radio on load
   normalizeFirstRowUI();
-
-  /* ---------- NEW: Add From / To (multi-route) ---------- */
-  const routesWrap  = document.getElementById('routes');
-  const addRouteBtn = document.getElementById('add-route');
-  if (routesWrap && addRouteBtn) {
-    addRouteBtn.addEventListener('click', () => {
-      // Clone the first route row
-      const firstRow = routesWrap.querySelector('.form-row');
-      if (!firstRow) return;
-      const clone = firstRow.cloneNode(true);
-
-      // Clear selections
-      clone.querySelectorAll('select').forEach(sel => {
-        sel.selectedIndex = 0;
-        // Ensure array-style names (backend supports origin[]/destination[])
-        if (sel.name === 'origin') sel.name = 'origin[]';
-        if (sel.name === 'destination') sel.name = 'destination[]';
-      });
-
-      // Remove duplicate IDs from cloned selects
-      clone.querySelectorAll('#origin, #destination').forEach(el => {
-        el.removeAttribute('id');
-      });
-
-      routesWrap.appendChild(clone);
-      clone.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    });
-  }
-
 });
