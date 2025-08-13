@@ -1,233 +1,326 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Transportation Quotation</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>DSV Transportation Quotation</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
 <body>
-  <img class="dsv-logo" src="{{ url_for('static', filename='dsv_logo.png') }}" alt="DSV" />
+  <!-- Floating DSV logo -->
+  <img src="{{ url_for('static', filename='dsv_logo.png') }}" alt="DSV Logo" class="dsv-logo" />
 
   <section class="quote-section">
     <div class="quote-card">
       <h1>Transportation Quotation</h1>
 
-      <!-- global cargo type -->
-      <label for="cargo_type">Cargo Type</label>
-      <select id="cargo_type">
-        <option value="general" selected>General Cargo</option>
-        <option value="chemical">Chemical Load</option>
-      </select>
+      <form action="{{ url_for('generate_transport') }}" method="POST" id="transportForm">
+        <!-- Top From / To (unchanged) -->
+        <div class="form-row">
+          <div class="form-group">
+            <label for="origin">From</label>
+            <select id="origin" name="origin" required>
+              <option value="">— Select Pickup —</option>
+              {% for o in origins %}
+                <option>{{ o }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="destination">To</label>
+            <select id="destination" name="destination" required>
+              <option value="">— Select City —</option>
+              {% for d in destinations %}
+                <option>{{ d }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
 
-      <!-- Requests wrapper: we’ll add blocks inside -->
-      <div id="requests"></div>
+        <!-- Main route block (as you already have) -->
+        <div id="routeBlocks">
+          <div class="group-box route-block" data-route-index="0">
+            <div class="group-title">Truck Types</div>
 
-      <button id="btn-generate" class="btn-generate">Generate</button>
+            <!-- Trip Type pills for main -->
+            <div class="form-group">
+              <label>Trip Type</label>
+              <div class="trip-options" data-trip>
+                <label class="selected">
+                  <input type="radio" name="trip_type" value="one_way" checked />
+                  <span>One Way</span>
+                </label>
+                <label>
+                  <input type="radio" name="trip_type" value="back_load" />
+                  <span>Back Load</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- First truck row -->
+            <div class="group-row trucks" data-trucks>
+              <div class="form-group">
+                <label class="tiny">Type</label>
+                <select name="truck_type_0[]" class="truck-type" required>
+                  <option value="">— Select Truck Type —</option>
+                  {% for t in truck_types %}
+                    <option value="{{ t }}">{{ t }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="form-group" style="max-width:120px;">
+                <label class="tiny">QTY</label>
+                <input type="number" name="truck_qty_0[]" class="truck-qty" min="1" step="1" value="1" />
+              </div>
+              <button type="button" class="btn-remove" data-role="remove-truck">Clear</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Buttons row (unchanged labels) -->
+        <div id="buttonsRow" style="margin-top:.5rem;">
+          <button type="button" id="add-truck-type" class="btn-add">+ Add Truck Type</button>
+          <button type="button" id="btnAddRoute" class="btn-add">+ Add From / To</button>
+        </div>
+
+        <!-- Cargo Type (unchanged) -->
+        <div class="form-group">
+          <label for="cargo_type">Cargo Type</label>
+          <select id="cargo_type" name="cargo_type" required>
+            <option value="general">General Cargo</option>
+            <option value="chemical">Chemical Load</option>
+            <option value="container">Container</option>
+          </select>
+        </div>
+
+        <button type="submit" class="btn-generate">Generate</button>
+      </form>
     </div>
   </section>
 
-  <!-- (Optional) your chatbot button/UI can stay as-is via chatbot.js -->
+  <!-- Chat toggle -->
+  <button class="chat-toggle" aria-label="Chat with DSV">
+    <img src="{{ url_for('static', filename='chat-icon.png') }}" alt="Chat" />
+  </button>
 
+  <!-- Chat box -->
+  <div id="chat-box" class="chat-box" aria-live="polite">
+    <div class="chat-header">
+      <span>DSV Assistant</span>
+      <button id="chat-close" title="Close chat">×</button>
+    </div>
+    <div class="chat-messages" id="chat-messages"></div>
+    <div class="chat-footer">
+      <input type="text" id="chat-input" placeholder="Type a message…" />
+      <button id="chat-send" type="button">Send</button>
+    </div>
+  </div>
+
+  <!-- Globals for JS -->
   <script>
-    // ---------- helpers ----------
-    const $  = (q, r=document) => r.querySelector(q);
-    const $$ = (q, r=document) => Array.from(r.querySelectorAll(q));
+    window.TRUCK_TYPES  = {{ truck_types|tojson }};
+    window.CICPA_CITIES = {{ cicpa_cities|tojson }};
+    window.LOCAL_TRUCKS = {{ local_trucks|tojson }};
+    window.CICPA_TRUCKS = {{ cicpa_trucks|tojson }};
+  </script>
 
-    const ORIGINS   = {{ origins|tojson }};
-    const CITIES    = {{ destinations|tojson }};
-    const TRUCKS_ALL = {{ truck_types|tojson }}; // union of all display labels
+  <!-- Your chatbot JS (unchanged) -->
+  <script src="{{ url_for('static', filename='chatbot.js') }}"></script>
 
-    // ---------- UI Makers ----------
-    function makeSelect(options, placeholder){
-      const s = document.createElement('select');
-      const ph = document.createElement('option');
-      ph.value = ""; ph.textContent = placeholder; ph.disabled = true; ph.selected = true;
-      s.appendChild(ph);
-      options.forEach(v=>{
-        const o = document.createElement('option');
-        o.value = v; o.textContent = v; s.appendChild(o);
-      });
-      return s;
-    }
+  <!-- Templates for rows/blocks -->
+  <template id="truckRowTpl">
+    <div class="group-row">
+      <div class="form-group">
+        <label class="tiny">Type</label>
+        <select class="truck-type" required>
+          <option value="">— Select Truck Type —</option>
+          {% for t in truck_types %}
+            <option value="{{ t }}">{{ t }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-group" style="max-width:120px;">
+        <label class="tiny">QTY</label>
+        <input type="number" class="truck-qty" min="1" step="1" value="1" />
+      </div>
+      <button type="button" class="btn-remove" data-role="remove-truck">Clear</button>
+    </div>
+  </template>
 
-    function makeTripSelector(){
-      const wrap = document.createElement('div');
-      wrap.className = 'trip-options';
-      const name = 'trip_'+Date.now()+'_'+Math.random().toString(36).slice(2,7);
+  <!-- Route block template WITH its own From/To and Trip Type pills (no "(Use main)") -->
+  <template id="routeBlockTpl">
+    <div class="group-box route-block">
+      <!-- From / To for this added route -->
+      <div class="form-row" data-route-fromto>
+        <div class="form-group">
+          <label class="tiny">From</label>
+          <select class="route-origin" required>
+            <option value="">— Select Pickup —</option>
+            {% for o in origins %}
+              <option>{{ o }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="tiny">To</label>
+          <select class="route-destination" required>
+            <option value="">— Select City —</option>
+            {% for d in destinations %}
+              <option>{{ d }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
 
-      const r1 = Object.assign(document.createElement('input'), {type:'radio', name, value:'one_way', id:'ow_'+name, checked:true});
-      const l1 = Object.assign(document.createElement('label'), {htmlFor:r1.id});
-      l1.textContent = 'One Way'; l1.classList.add('selected');
+      <div class="group-title">Truck Types</div>
 
-      const r2 = Object.assign(document.createElement('input'), {type:'radio', name, value:'back_load', id:'bl_'+name});
-      const l2 = Object.assign(document.createElement('label'), {htmlFor:r2.id});
-      l2.textContent = 'Back Load';
+      <!-- Trip Type pills (same as main) -->
+      <div class="form-group">
+        <label>Trip Type</label>
+        <div class="trip-options" data-trip>
+          <label class="selected">
+            <input type="radio" value="one_way" checked />
+            <span>One Way</span>
+          </label>
+          <label>
+            <input type="radio" value="back_load" />
+            <span>Back Load</span>
+          </label>
+        </div>
+      </div>
 
-      function refresh(){
-        l1.classList.toggle('selected', r1.checked);
-        l2.classList.toggle('selected', r2.checked);
-      }
-      r1.addEventListener('change', refresh);
-      r2.addEventListener('change', refresh);
+      <!-- One default truck row -->
+      <div class="group-row trucks" data-trucks>
+        <div class="form-group">
+          <label class="tiny">Type</label>
+          <select class="truck-type" required>
+            <option value="">— Select Truck Type —</option>
+            {% for t in truck_types %}
+              <option value="{{ t }}">{{ t }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group" style="max-width:120px;">
+          <label class="tiny">QTY</label>
+          <input type="number" class="truck-qty" min="1" step="1" value="1" />
+        </div>
+        <button type="button" class="btn-remove" data-role="remove-truck">Clear</button>
+      </div>
 
-      // Robust label click (even if something overlays)
-      wrap.addEventListener('click', (e)=>{
-        if(e.target.tagName === 'LABEL'){
-          const id = e.target.getAttribute('for');
-          const inp = wrap.querySelector('#'+CSS.escape(id));
-          if(inp){ inp.checked = true; refresh(); }
-        }
-      });
+      <!-- Per-block actions -->
+      <div class="form-row" style="gap:.5rem; margin-top:.5rem;">
+        <button type="button" class="btn-add" data-role="add-truck">+ Add Truck Type</button>
+        <button type="button" class="btn-remove" data-role="remove-route">Clear</button>
+      </div>
+    </div>
+  </template>
 
-      wrap.append(r1,l1,r2,l2);
-      return wrap;
-    }
+  <!-- Minimal JS: main Add Truck, Add From/To (full boxed block with From/To + Trip pills) -->
+  <script>
+  (function () {
+    const routeBlocks = document.getElementById('routeBlocks');
+    const addRouteBtn = document.getElementById('btnAddRoute');
+    const buttonsRow  = document.getElementById('buttonsRow');
+    const truckRowTpl = document.getElementById('truckRowTpl');
+    const routeTpl    = document.getElementById('routeBlockTpl');
+    if (!routeBlocks || !addRouteBtn || !buttonsRow || !truckRowTpl || !routeTpl) return;
 
-    function makeTruckRow(){
-      const row = document.createElement('div');
-      row.className = 'truck-type-row';
-
-      const selWrap = document.createElement('div');
-      selWrap.className = 'select-wrapper';
-      const lbl1 = document.createElement('label'); lbl1.textContent = 'Type';
-      const sel = makeSelect(TRUCKS_ALL, '— Select Truck Type —');
-      selWrap.append(lbl1, sel);
-
-      const qtyWrap = document.createElement('div');
-      qtyWrap.className = 'qty-wrapper';
-      const lbl2 = document.createElement('label'); lbl2.textContent = 'QTY';
-      const qty = Object.assign(document.createElement('input'), {type:'number', min:'1', step:'1', value:'1'});
-      qtyWrap.append(lbl2, qty);
-
-      const btnClear = document.createElement('button');
-      btnClear.type = 'button';
-      btnClear.className = 'btn-remove';
-      btnClear.textContent = 'Clear';
-      btnClear.addEventListener('click', ()=> row.remove());
-
-      row.append(selWrap, qtyWrap, btnClear);
-      return row;
-    }
-
-    function makeRequestBlock({withRemove=false}={}){
-      const block = document.createElement('div');
-      block.className = 'request-block';
-
-      // Row: From / To
-      const rowFT = document.createElement('div');
-      rowFT.className = 'form-row';
-      const g1 = document.createElement('div'); g1.className = 'form-group';
-      const g2 = document.createElement('div'); g2.className = 'form-group';
-
-      const lFrom = document.createElement('label'); lFrom.textContent = 'From';
-      const sFrom = makeSelect(ORIGINS, '— Select Pickup —');
-
-      const lTo = document.createElement('label'); lTo.textContent = 'To';
-      const sTo = makeSelect(CITIES, '— Select City —');
-
-      g1.append(lFrom, sFrom); g2.append(lTo, sTo);
-      rowFT.append(g1, g2);
-
-      // Trip card box
-      const tripCard = document.createElement('div');
-      tripCard.className = 'trip-card';
-
-      const tLabel = document.createElement('label'); tLabel.textContent = 'Trip Type';
-      const tripSel = makeTripSelector();
-      tripCard.append(tLabel, tripSel);
-
-      // trucks container + first row
-      const trucksWrap = document.createElement('div');
-      trucksWrap.className = 'trucks';
-      trucksWrap.append( makeTruckRow() );
-
-      const actions = document.createElement('div');
-      actions.className = 'request-actions';
-
-      const btnAddTruck = document.createElement('button');
-      btnAddTruck.type = 'button';
-      btnAddTruck.className = 'btn-add';
-      btnAddTruck.textContent = '+ Add Truck Type';
-      btnAddTruck.addEventListener('click', ()=> trucksWrap.append( makeTruckRow() ));
-
-      const btnAddFT = document.createElement('button');
-      btnAddFT.type = 'button';
-      btnAddFT.className = 'btn-add-ft';
-      btnAddFT.textContent = '+ Add From/To';
-      btnAddFT.addEventListener('click', ()=> addRequestBlock(true));
-
-      const btnRemoveBlock = document.createElement('button');
-      btnRemoveBlock.type = 'button';
-      btnRemoveBlock.className = 'btn-remove btn-remove-block';
-      btnRemoveBlock.textContent = 'Remove From/To';
-      btnRemoveBlock.style.marginLeft = 'auto';
-      btnRemoveBlock.addEventListener('click', ()=> block.remove());
-
-      actions.append(btnAddTruck, btnAddFT);
-      if (withRemove) actions.append(btnRemoveBlock);
-
-      tripCard.append(trucksWrap, actions);
-      block.append(rowFT, tripCard);
-      return block;
-    }
-
-    function addRequestBlock(withRemove){
-      $('#requests').appendChild(makeRequestBlock({withRemove}));
-    }
-
-    // ---------- boot ----------
-    addRequestBlock(false); // first block (no remove)
-    // main trip radios styling safety (if you later put a "main" set above blocks)
-    // handled per-block by makeTripSelector()
-
-    // ---------- submit ----------
-    $('#btn-generate').addEventListener('click', async ()=>{
-      const cargo_type = $('#cargo_type').value;
-      const requests = [];
-      $$('#requests .request-block').forEach((b)=>{
-        const origin = $('select', $('.form-group', b));
-        const dest   = $$('.form-group select', b)[1];
-        const trip   = $('.trip-options input[type=radio]:checked', b);
-        const trucks = [];
-
-        $$('.trucks .truck-type-row', b).forEach((r)=>{
-          const label = $('select', r).value || '';
-          const qty   = $('input[type=number]', r).value || '0';
-          if(label && Number(qty) > 0){
-            trucks.push({label, qty, trip_kind: (trip ? trip.value : 'one_way')});
-          }
+    // Trip pill selector toggle (adds/removes .selected on labels)
+    function wireTripPills(container) {
+      const labels = Array.from(container.querySelectorAll('label'));
+      labels.forEach(lbl => {
+        const input = lbl.querySelector('input[type="radio"]');
+        if (!input) return;
+        input.addEventListener('change', () => {
+          labels.forEach(l => l.classList.remove('selected'));
+          lbl.classList.add('selected');
         });
-
-        if(origin && dest){
-          requests.push({
-            origin: origin.value || '',
-            destination: dest.value || '',
-            main_trip: (trip ? trip.value : 'one_way'),
-            trucks
-          });
-        }
       });
+    }
 
-      if(!requests.length){ alert('Please fill at least one From/To and a truck.'); return; }
+    // Wire one truck row's Clear
+    function wireTruckRow(row) {
+      const rm = row.querySelector('[data-role="remove-truck"]');
+      if (rm) rm.addEventListener('click', () => row.remove());
+    }
 
-      try{
-        const res = await fetch('/generate_transport_multi', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ cargo_type, requests })
-        });
-        if(!res.ok){ const err = await res.json().catch(()=>({error:'Server error'})); throw new Error(err.error||'Server error'); }
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url; a.download = 'Transport_Quotation_Multi.docx';
-        document.body.appendChild(a); a.click();
-        a.remove(); URL.revokeObjectURL(url);
-      }catch(e){
-        alert(e.message || 'Failed to generate document.');
+    // Set distinct names for added route block to avoid touching your backend for the main route
+    function setNamesForBlock(block, idx) {
+      // From/To for this route
+      const o = block.querySelector('.route-origin');
+      const d = block.querySelector('.route-destination');
+      if (o) o.name = `origin_${idx}`;
+      if (d) d.name = `destination_${idx}`;
+
+      // Trip type pills (radio group name)
+      const trip = block.querySelector('[data-trip]');
+      if (trip) {
+        trip.querySelectorAll('input[type="radio"]').forEach(r => r.name = `trip_type_${idx}`);
       }
+
+      // Truck rows
+      block.querySelectorAll('.truck-type').forEach(el => el.name = `truck_type_${idx}[]`);
+      block.querySelectorAll('.truck-qty').forEach(el => el.name = `truck_qty_${idx}[]`);
+    }
+
+    // Wire a route block
+    function wireRouteBlock(block, idx) {
+      setNamesForBlock(block, idx);
+
+      // Trip pills styling
+      const tripWrap = block.querySelector('[data-trip]');
+      if (tripWrap) wireTripPills(tripWrap);
+
+      // Add-truck inside this block
+      const trucksWrap = block.querySelector('[data-trucks]');
+      const addTruckBtn = block.querySelector('[data-role="add-truck"]');
+      if (addTruckBtn && trucksWrap) {
+        addTruckBtn.addEventListener('click', () => {
+          const row = truckRowTpl.content.firstElementChild.cloneNode(true);
+          row.querySelector('.truck-type').name = `truck_type_${idx}[]`;
+          row.querySelector('.truck-qty').name  = `truck_qty_${idx}[]`;
+          wireTruckRow(row);
+          trucksWrap.insertAdjacentElement('beforeend', row);
+        });
+      }
+
+      // Clear truck rows
+      block.querySelectorAll('[data-role="remove-truck"]').forEach(wireTruckRow);
+
+      // Remove the whole added route
+      const rmRoute = block.querySelector('[data-role="remove-route"]');
+      if (rmRoute) rmRoute.addEventListener('click', () => block.remove());
+    }
+
+    // Wire trip pills in main block so visuals stay in sync
+    const mainTrip = document.querySelector('.route-block[data-route-index="0"] [data-trip]');
+    if (mainTrip) wireTripPills(mainTrip);
+
+    // Main "+ Add Truck Type" adds to first block only (index 0)
+    (function wireMainAddTruck() {
+      const mainAddBtn = document.getElementById('add-truck-type');
+      const mainBlock  = routeBlocks.querySelector('.route-block[data-route-index="0"]');
+      if (!mainAddBtn || !mainBlock) return;
+      const trucksWrap = mainBlock.querySelector('[data-trucks]');
+
+      mainAddBtn.addEventListener('click', () => {
+        const row = truckRowTpl.content.firstElementChild.cloneNode(true);
+        row.querySelector('.truck-type').name = 'truck_type_0[]';
+        row.querySelector('.truck-qty').name  = 'truck_qty_0[]';
+        wireTruckRow(row);
+        trucksWrap.insertAdjacentElement('beforeend', row);
+      });
+    })();
+
+    // "+ Add From / To" → insert full boxed route (with its own From/To + Trip pills) ABOVE buttons row
+    let routeIdx = 1; // main is 0
+    addRouteBtn.addEventListener('click', () => {
+      const node = routeTpl.content.firstElementChild.cloneNode(true);
+      wireRouteBlock(node, routeIdx++);
+      buttonsRow.insertAdjacentElement('beforebegin', node);
     });
+  })();
   </script>
 </body>
 </html>
