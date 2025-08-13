@@ -113,31 +113,39 @@
 
   <!-- Minimal From/To adder (keeps style & backend exactly as-is) -->
   <script>
-  (function () {
-    const addBtn = document.getElementById('btnAddRoute');
-    if (!addBtn) return;
+// Add From/To without changing style or layout
+(function () {
+  const addBtn = document.getElementById('btnAddRoute');
+  if (!addBtn) return;
 
-    const fromSel = document.getElementById('origin');
-    const toSel   = document.getElementById('destination');
-    if (!fromSel || !toSel) return;
+  const fromSel = document.getElementById('origin');
+  const toSel   = document.getElementById('destination');
+  if (!fromSel || !toSel) return;
 
-    // Find the row that contains both selects
-    const routeRow   = fromSel.closest('.form-row');
-    const routesWrap = routeRow ? routeRow.parentElement : null;
-    if (!routeRow || !routesWrap) return;
+  // Mark the first row so we can insert new ones right after it
+  const firstRow = fromSel.closest('.form-row');
+  if (!firstRow) return;
+  firstRow.classList.add('route-row');
 
-    addBtn.addEventListener('click', () => {
-      const clone = routeRow.cloneNode(true);
+  addBtn.addEventListener('click', () => {
+    // Always clone the first route row
+    const clone = firstRow.cloneNode(true);
 
-      // Reset selects and remove duplicate IDs (names stay the same)
-      clone.querySelectorAll('select').forEach(s => {
-        s.selectedIndex = 0;
-        if (s.id) s.removeAttribute('id'); // avoid duplicate IDs
-      });
-
-      routesWrap.appendChild(clone);
+    // Reset selects and remove duplicate IDs
+    clone.querySelectorAll('select').forEach(s => {
+      s.selectedIndex = 0;
+      if (s.id) s.removeAttribute('id');
     });
-  })();
-  </script>
+
+    // Tag the clone and insert it *after the last* route row
+    clone.classList.add('route-row');
+    const parent = firstRow.parentElement;
+    const rows = parent.querySelectorAll('.route-row');
+    const last = rows[rows.length - 1];
+    last.insertAdjacentElement('afterend', clone);
+  });
+})();
+</script>
 </body>
 </html>
+
