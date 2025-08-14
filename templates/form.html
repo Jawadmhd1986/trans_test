@@ -23,13 +23,23 @@
         <label for="storage">Storage Type</label>
         <select id="storage" name="storage_type" required>
           <option value="">— Select —</option>
+
+          <!-- Standard -->
           <option>AC</option>
           <option>Non-AC</option>
           <option>Open Shed</option>
+
+          <!-- Chemical -->
           <option>Chemicals AC</option>
-          <option>Chemicals Non-AC</option>
+          <option>Chemicals Non-AC (Non-DG)</option>
+          <option>Chemicals Non-AC (DG)</option>
+
+          <!-- Open Yard -->
           <option>Open Yard – KIZAD</option>
-          <option>Open Yard – Mussafah</option>
+          <!-- replaced the single Mussafah option with 3 choices -->
+          <option>Open Yard – Mussafah (Open Yard)</option>
+          <option>Open Yard – Mussafah (Open Yard Shed)</option>
+          <option>Open Yard – Mussafah (Jumbo Bag)</option>
         </select>
 
         <label for="volume">Volume (CBM or SQM)</label>
