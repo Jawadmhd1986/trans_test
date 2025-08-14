@@ -1,100 +1,75 @@
-from flask import Flask, render_template, request, send_file, jsonify
+from flask import Flask, render_template, request, send_file
 from docx import Document
 import os
-import re
 import math
 from datetime import datetime
-
-# NEW: read your tariff workbook
-import pandas as pd
+import pandas as pd  # Excel matrix
 
 app = Flask(__name__)
 
-# ----------------------- TARIFF LOADER (reads your Excel) -----------------------
-# Put this Excel file next to app.py with the exact same name
+# ===== Excel-driven matrix for Standard tiers =====
 TARIFF_PATH = "CL TARIFF - 2025 v3 (004) - UPDATED 6TH AUGUST 2025.xlsx"
 
-def _bands_from_rows(df, rows, from_col, to_col, rate_col):
-    """Return [(from, to, rate), ...] using 0-based row indexes and column indexes."""
-    bands = []
+def _is_num(x):
+    return isinstance(x, (int, float)) and pd.notna(x)
+
+def _daily_rate_from_row(df, r, from_col=2, to_col=3):
+    """Pick a plausible AED/CBM/DAY cell from the row (skip From/To)."""
+    candidates, fallback = [], []
+    for c in range(df.shape[1]):
+        if c in (from_col, to_col):
+            continue
+        v = df.iat[r, c]
+        if _is_num(v):
+            v = float(v)
+            # filter out handling/minimum values
+            if 1.2 <= v <= 10.0:
+                candidates.append(v)
+            elif v > 0:
+                fallback.append(v)
+    if candidates:
+        return min(candidates)
+    return min(fallback) if fallback else 0.0
+
+def _bands_from_rows(df, rows, from_col=2, to_col=3):
+    out = []
     for r in rows:
         f = df.iat[r, from_col]
         t = df.iat[r, to_col]
-        rate = df.iat[r, rate_col]
         if isinstance(t, str) and "above" in t.lower():
             t = float("inf")
-        bands.append((float(f), float(t), float(rate)))
-    return bands
+        rate = _daily_rate_from_row(df, r, from_col, to_col)
+        out.append((float(f), float(t), float(rate)))
+    return out
 
-def load_tariff():
-    """
-    Reads the workbook and returns:
-      - ac: {'lt1m':[(f,t,r)...], 'ge1m':[(f,t,r)...], 'min_month':3500}
-      - dry: {...}
-      - chemical: {'ac_per_day': x, 'nonac_per_day': y}
-      - open_yard: {'per_day': d, 'per_month': m, 'per_year': y}
-    NOTE: Row/column positions match your shared file. If the sheet layout changes,
-          update the indexes accordingly.
-    """
+def load_matrix():
     xls = pd.ExcelFile(TARIFF_PATH)
-
-    # Warehouse & Open Yard matrix
     wh = pd.read_excel(xls, "CL - WH & OY (2)", header=None)
 
-    # AC tiers — columns: From=2, To=3, Rate=5
-    ac_lt1m_rows = [5, 6, 7]      # 1–100, 101–300, 301+
-    ac_ge1m_rows = [12, 13, 14]   # 1–100, 101–300, 301+
-    ac_lt1m = _bands_from_rows(wh, ac_lt1m_rows, 2, 3, 5)
-    ac_ge1m = _bands_from_rows(wh, ac_ge1m_rows, 2, 3, 5)
-    ac_min_month = 3500.0
-
-    # Dry/Ambient (Non-AC) tiers
+    ac_lt1m_rows  = [5, 6, 7]
+    ac_ge1m_rows  = [12, 13, 14]
     dry_lt1m_rows = [22, 23, 24]
     dry_ge1m_rows = [29, 30, 31]
-    dry_lt1m = _bands_from_rows(wh, dry_lt1m_rows, 2, 3, 5)
-    dry_ge1m = _bands_from_rows(wh, dry_ge1m_rows, 2, 3, 5)
-    dry_min_month = 3500.0
-
-    # Open Yard sheet (day / month / year)
-    oy = pd.read_excel(xls, "open yard stoarge handling Tarr", header=None)
-    oy_per_day = float(oy.iat[3, 2])    # e.g. 1 AED / SQM / Day
-    oy_per_month = float(oy.iat[3, 3])  # e.g. 15 AED / SQM / Month
-    oy_per_year = float(oy.iat[3, 4])   # e.g. 140 AED / SQM / Year
-
-    # Chemical rates sheet
-    ch = pd.read_excel(xls, "CHEMICAL RATE", header=None)
-    chem_ac = 4.25      # fallback
-    chem_nonac = 3.50   # fallback
-    # try to find rows by label presence, then pick last numeric in the row
-    try:
-        mask_ac = ch.applymap(lambda v: isinstance(v, str) and "temperature" in v.lower()).any(axis=1)
-        row_ac = ch[mask_ac].index[0]
-        chem_ac = float([x for x in ch.iloc[row_ac].tolist() if isinstance(x, (int, float))][-1])
-    except Exception:
-        pass
-    try:
-        mask_dn = ch.applymap(lambda v: isinstance(v, str) and "dry storage" in v.lower()).any(axis=1)
-        row_dn = ch[mask_dn].index[0]
-        chem_nonac = float([x for x in ch.iloc[row_dn].tolist() if isinstance(x, (int, float))][-1])
-    except Exception:
-        pass
 
     return {
-        "ac": {"lt1m": ac_lt1m, "ge1m": ac_ge1m, "min_month": ac_min_month},
-        "dry": {"lt1m": dry_lt1m, "ge1m": dry_ge1m, "min_month": dry_min_month},
-        "chemical": {"ac_per_day": chem_ac, "nonac_per_day": chem_nonac},
-        "open_yard": {"per_day": oy_per_day, "per_month": oy_per_month, "per_year": oy_per_year},
+        "ac": {
+            "lt1m": _bands_from_rows(wh, ac_lt1m_rows),
+            "ge1m": _bands_from_rows(wh, ac_ge1m_rows)
+        },
+        "dry": {
+            "lt1m": _bands_from_rows(wh, dry_lt1m_rows),
+            "ge1m": _bands_from_rows(wh, dry_ge1m_rows)
+        },
     }
 
-TARIFF = load_tariff()
+MATRIX = load_matrix()
 
 def pick_tier_rate(bands, volume):
-    """Pick the correct rate from [(from,to,rate), ...] for the given volume."""
     for f, t, r in bands:
         if f <= volume <= t:
             return r
-    return bands[-1][2]  # fallback to last band
-# -------------------------------------------------------------------------------
+    return bands[-1][2] if bands else 0.0
+# ==================================================
 
 @app.route("/")
 def index():
@@ -109,7 +84,7 @@ def generate():
     commodity = request.form.get("commodity", "").strip()
     today_str = datetime.today().strftime("%d %b %Y")
 
-    # Pick template based on storage_type (unchanged)
+    # Pick template based on storage_type
     if "chemical" in storage_type.lower():
         template_path = "templates/Chemical VAS.docx"
     elif "open yard" in storage_type.lower():
@@ -119,63 +94,67 @@ def generate():
 
     doc = Document(template_path)
 
-    # ---------------------- MATRIX RATES / UNITS (from Excel) ----------------------
-    st_lower = storage_type.lower()
-    period_lt_1m = days < 30
-    months_started = max(1, math.ceil(days / 30))  # per-started-month minimums
-
-    # Defaults
+    # ===== Rates / units (matrix for Standard; Chemical split; Open Yard monthly options) =====
+    unit, rate_unit = "CBM", "CBM / DAY"
     rate = 0.0
-    unit = "CBM"
-    rate_unit = "CBM / DAY"
     storage_fee = 0.0
+    period_lt_1m = days < 30
 
     if storage_type == "AC":
-        bands = TARIFF["ac"]["lt1m"] if period_lt_1m else TARIFF["ac"]["ge1m"]
+        bands = MATRIX["ac"]["lt1m"] if period_lt_1m else MATRIX["ac"]["ge1m"]
         rate = pick_tier_rate(bands, volume)
-        calc = volume * days * rate
-        storage_fee = max(calc, months_started * TARIFF["ac"]["min_month"])
+        storage_fee = volume * days * rate
 
-    elif storage_type == "Non-AC":
-        bands = TARIFF["dry"]["lt1m"] if period_lt_1m else TARIFF["dry"]["ge1m"]
+    elif storage_type == "Non-AC" or storage_type == "Open Shed":
+        bands = MATRIX["dry"]["lt1m"] if period_lt_1m else MATRIX["dry"]["ge1m"]
         rate = pick_tier_rate(bands, volume)
-        calc = volume * days * rate
-        storage_fee = max(calc, months_started * TARIFF["dry"]["min_month"])
-
-    elif storage_type == "Open Shed":
-        # Follow Dry/Ambient matrix (same bands) unless you provide a separate Open Shed table
-        bands = TARIFF["dry"]["lt1m"] if period_lt_1m else TARIFF["dry"]["ge1m"]
-        rate = pick_tier_rate(bands, volume)
-        calc = volume * days * rate
-        storage_fee = max(calc, months_started * TARIFF["dry"]["min_month"])
+        storage_fee = volume * days * rate
 
     elif storage_type == "Chemicals AC":
-        rate = TARIFF["chemical"]["ac_per_day"]
+        rate = 3.5
         storage_fee = volume * days * rate
 
-    elif storage_type == "Chemicals Non-AC":
-        rate = TARIFF["chemical"]["nonac_per_day"]
+    elif storage_type == "Chemicals Non-AC (Non-DG)":
+        rate = 2.5
         storage_fee = volume * days * rate
 
-    elif "open yard" in st_lower:
-        # Use Open Yard day/month/year from sheet; choose the lowest for the given duration
-        unit = "SQM"
-        rate_unit = "SQM / DAY"
-        rate = TARIFF["open_yard"]["per_day"]
-        by_day   = volume * days * TARIFF["open_yard"]["per_day"]
-        by_month = volume * months_started * TARIFF["open_yard"]["per_month"]
-        by_year  = volume * (days / 365.0) * TARIFF["open_yard"]["per_year"]
-        storage_fee = min(by_day, by_month, by_year)
+    elif storage_type == "Chemicals Non-AC (DG)":
+        rate = 3.0
+        storage_fee = volume * days * rate
+
+    elif storage_type == "Chemicals Non-AC":  # backward compatibility
+        rate = 2.5
+        storage_fee = volume * days * rate
+
+    elif "open yard – kizad" in storage_type.lower():
+        rate, unit, rate_unit = 125, "SQM", "SQM / YEAR"
+        storage_fee = volume * days * (rate / 365)
+
+    elif storage_type == "Open Yard – Mussafah (Open Yard)":
+        unit, rate_unit, rate = "SQM", "SQM / MONTH", 15.0
+        storage_fee = volume * days * (rate / 30.0)
+
+    elif storage_type == "Open Yard – Mussafah (Open Yard Shed)":
+        unit, rate_unit, rate = "SQM", "SQM / MONTH", 35.0
+        storage_fee = volume * days * (rate / 30.0)
+
+    elif storage_type == "Open Yard – Mussafah (Jumbo Bag)":
+        unit, rate_unit, rate = "BAG", "BAG / MONTH", 19.0
+        storage_fee = volume * days * (rate / 30.0)
 
     else:
         rate, unit, rate_unit, storage_fee = 0, "CBM", "CBM / DAY", 0
 
     storage_fee = round(storage_fee, 2)
 
-    # WMS calculation (unchanged)
-    months = months_started  # keep your variable name for placeholders below
-    is_open_yard = "open yard" in storage_type.lower()
-    wms_fee = 0 if is_open_yard or not include_wms else 1500 * months
+    # ===== WMS (625/month for Chemicals, 1500/month otherwise; excluded for Open Yard) =====
+    months = max(1, days // 30)  # minimum 1 month if included
+    st_lower = storage_type.lower()
+    is_open_yard = "open yard" in st_lower
+    is_chemical = "chemical" in st_lower
+    wms_monthly = 625 if is_chemical else 1500
+    wms_fee = 0 if is_open_yard or not include_wms else wms_monthly * months
+
     total_fee = round(storage_fee + wms_fee, 2)
 
     placeholders = {
@@ -192,7 +171,11 @@ def generate():
         "{{COMMODITY}}": commodity or "N/A",
     }
 
-    # Replace placeholders even if Word split them across runs (unchanged)
+    # If Chemical template shows a static "1,500.00 AED / MONTH", replace it with 625.00
+    if is_chemical:
+        placeholders["1,500.00 AED / MONTH"] = "625.00 AED / MONTH"
+
+    # ===== Replace placeholders even if Word split them across runs =====
     def replace_in_paragraph(paragraph, mapping):
         if not paragraph.runs:
             return
@@ -216,7 +199,7 @@ def generate():
 
     replace_placeholders(doc, placeholders)
 
-    # Delete blocks bracketed by [TAG] ... [/TAG] (unchanged)
+    # ===== Delete blocks bracketed by [TAG] ... [/TAG] =====
     def _delete_block_in_paragraphs(doc_obj, start_tag, end_tag):
         inside = False
         to_delete = []
@@ -260,17 +243,18 @@ def generate():
         _delete_block_in_paragraphs(doc_obj, start_tag, end_tag)
         _delete_block_in_tables(doc_obj, start_tag, end_tag)
 
-    # Keep only the relevant VAS section (unchanged)
-    if "open yard" in storage_type.lower():
+    # Keep only the relevant VAS section
+    if "open yard" in st_lower:
         delete_block(doc, "[VAS_STANDARD]", "[/VAS_STANDARD]")
         delete_block(doc, "[VAS_CHEMICAL]", "[/VAS_CHEMICAL]")
-    elif "chemical" in storage_type.lower():
+    elif "chemical" in st_lower:
         delete_block(doc, "[VAS_STANDARD]", "[/VAS_STANDARD]")
         delete_block(doc, "[VAS_OPENYARD]", "[/VAS_OPENYARD]")
     else:
         delete_block(doc, "[VAS_CHEMICAL]", "[/VAS_CHEMICAL]")
         delete_block(doc, "[VAS_OPENYARD]", "[/VAS_OPENYARD]")
 
+    # ===== Save & return =====
     os.makedirs("generated", exist_ok=True)
     filename_prefix = commodity if commodity else "quotation"
     filename = f"Quotation_{filename_prefix}.docx"
@@ -278,6 +262,8 @@ def generate():
     doc.save(output_path)
 
     return send_file(output_path, as_attachment=True)
+
+
 
 @app.route("/chat", methods=["POST"])
 def chat():
