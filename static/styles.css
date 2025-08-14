@@ -1,0 +1,246 @@
+:root {
+  --blue-dsv:       #002664;
+  --blue-dsv-light: #4B87E0;
+  --white:          #ffffff;
+  --grey-bg:        #f0f0f0;
+  --text-dsv:       #002664;
+}
+
+/* Reset & base */
+*, *::before, *::after { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: var(--grey-bg);
+  height: calc(var(--vh, 1vh) * 100); /* mobile 100vh fix */
+  overflow: hidden;
+}
+
+/* Full-screen blue background with extra top padding for logo */
+.quote-section {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: var(--blue-dsv);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 6rem 2rem 2rem;
+}
+
+/* Logo floating above the card */
+.dsv-logo {
+  position: absolute;
+  top: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 140px;
+}
+
+/* White card */
+.quote-card {
+  background: var(--white);
+  border-radius: 12px;
+  padding: 1rem 1.5rem 1rem;
+  width: 100%;
+  max-width: 420px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+}
+.quote-card h1 {
+  margin: 0 0 1rem;
+  margin-top: 0 !important;
+  padding-top: 0 !important;
+  margin-bottom: 1rem;
+  transform: translateY(-1rem);
+  color: var(--text-dsv);
+  font-size: 1.6rem;
+  text-align: center;
+}
+.quote-card label {
+  display: block;
+  margin: 0.75rem 0 0.25rem;
+  font-weight: bold;
+  color: var(--text-dsv);
+  font-size: 0.95rem;
+}
+.quote-card select,
+.quote-card input {
+  width: 100%;
+  padding: 0.6rem 1rem;
+  border: 1px solid var(--blue-dsv);
+  border-radius: 6px;
+  font-size: 1rem;
+  color: var(--text-dsv);
+}
+.quote-card select:focus,
+.quote-card input:focus {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(0,56,155,0.3);
+}
+.btn-generate {
+  margin-top: 1.5rem;
+  width: 100%;
+  padding: 0.9rem;
+  background: var(--blue-dsv);
+  color: var(--white);
+  border: none;
+  border-radius: 6px;
+  font-size: 1.1rem;
+  cursor: pointer;
+  transition: background 0.2s;
+  font-weight: bold;
+}
+.btn-generate:hover { background: var(--blue-dsv-light); }
+
+/* Chat toggle button */
+.chat-toggle {
+  position: absolute;
+  bottom: 2.5rem;
+  right: 2rem;
+  background: var(--white);
+  border: none;
+  padding: 0.5rem;
+  border-radius: 50%;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  cursor: pointer;
+}
+.chat-toggle img { width: 36px; height: 36px; }
+
+/* Chat widget container */
+.chat-box {
+  position: fixed;
+  bottom: 6rem;
+  right: 2rem;
+  width: 300px;
+  max-width: 90%;
+  max-height: 70vh;
+  background: var(--white);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+  transform: translateY(200%);
+  transition: transform 0.3s ease;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 1000;
+}
+.chat-box.open { transform: translateY(0); }
+
+/* Chat header */
+.chat-header {
+  background: var(--blue-dsv);
+  color: var(--white);
+  padding: 0.8rem 1rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: bold;
+}
+.chat-header button {
+  background: none;
+  border: none;
+  color: var(--white);
+  font-size: 1.2rem;
+  cursor: pointer;
+}
+
+/* Chat message area */
+.chat-messages {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  background: #f9f9f9;
+  overflow-y: auto;
+}
+
+/* Message bubbles */
+.message { margin-bottom: 0.6rem; clear: both; }
+.message.user .bubble {
+  background: var(--blue-dsv);
+  color: var(--white);
+  padding: 0.4rem 0.8rem;
+  border-radius: 16px 16px 4px 16px;
+  float: right;
+  max-width: 80%;
+}
+.message.bot .bubble {
+  background: #e2e2e2;
+  color: #000;
+  padding: 0.4rem 0.8rem;
+  border-radius: 16px 16px 16px 4px;
+  float: left;
+  max-width: 80%;
+  white-space: pre-line;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.message.bot .bubble a {
+  color: #002664;
+  text-decoration: underline;
+  word-break: break-word;
+}
+
+/* Chat input */
+.chat-footer { display: flex; border-top: 1px solid #ccc; }
+.chat-footer input {
+  flex: 1; padding: 0.6rem; border: none; font-size: 1rem;
+}
+.chat-footer button {
+  background: var(--blue-dsv); color: var(--white);
+  border: none; padding: 0 1rem; cursor: pointer; transition: background 0.2s;
+}
+.chat-footer button:hover { background: var(--blue-dsv-light); }
+
+/* Backdrop (sits under chat) */
+.chat-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.35);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .2s;
+  z-index: 999; /* chat-box is 1000 */
+}
+.chat-backdrop.open { opacity: 1; pointer-events: auto; }
+
+/* Mobile tweaks — keep chat as a small pop-up (NOT full-screen) */
+@media (max-width: 480px) {
+  .dsv-logo { width: 120px; top: 1.7rem; }
+  .quote-card { padding: 3rem 1rem 0.75rem; max-width: 320px; }
+  .btn-generate { font-size: 1rem; padding: 0.8rem; }
+
+  /* chat pop-up sizing/position */
+  .chat-box {
+    position: fixed;
+    width: 92vw;
+    right: 4vw;
+    bottom: calc(env(safe-area-inset-bottom, 16px) + 72px);
+    max-height: 65vh;
+    border-radius: 12px;
+    z-index: 1000;
+  }
+  .chat-box.open { transform: translateY(0); }
+
+  /* launcher button sits above the safe area */
+  .chat-toggle {
+    position: fixed;
+    right: 4vw;
+    bottom: env(safe-area-inset-bottom, 16px);
+    z-index: 1100;
+  }
+
+  /* scroll only inside the chat */
+  .chat-messages { flex: 1; overflow-y: auto; }
+
+  /* keep header visible while scrolling */
+  .chat-header { position: sticky; top: 0; z-index: 1; }
+
+  /* when keyboard opens (JS adds .kb), give the chat extra height */
+  .chat-box.kb {
+    bottom: 0;
+    right: 4vw;
+    width: 92vw;
+    max-height: calc(100dvh - 6vh);
+  }
+.chat-window { display: none !important; }
+}
+

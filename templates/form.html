@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DSV Quotation Generator</title>
+
+  <!-- Main stylesheet -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body>
+
+  <div class="quote-section">
+    <!-- Floating DSV logo -->
+    <img src="{{ url_for('static', filename='dsv_logo.png') }}"
+         alt="DSV Logo"
+         class="dsv-logo" />
+
+    <!-- White card container -->
+    <div class="quote-card">
+      <h1>Quotation Generator</h1>
+      <form action="{{ url_for('generate') }}" method="post">
+        <label for="storage">Storage Type</label>
+        <select id="storage" name="storage_type" required>
+          <option value="">— Select —</option>
+          <option>AC</option>
+          <option>Non-AC</option>
+          <option>Open Shed</option>
+          <option>Chemicals AC</option>
+          <option>Chemicals Non-AC</option>
+          <option>Open Yard – KIZAD</option>
+          <option>Open Yard – Mussafah</option>
+        </select>
+
+        <label for="volume">Volume (CBM or SQM)</label>
+        <input type="number" step="0.01" id="volume" name="volume" required />
+
+        <label for="days">Duration (Days)</label>
+        <input type="number" id="days" name="days" required />
+
+        <label for="wms">Include WMS?</label>
+        <select id="wms" name="wms" required>
+          <option>Yes</option>
+          <option>No</option>
+        </select>
+
+        <label for="commodity">Commodity</label>
+        <input type="text" id="commodity" name="commodity" placeholder="e.g., Furniture / Machinery" required>
+
+        <button type="submit" class="btn-generate">
+          Generate
+        </button>
+      </form>
+    </div>
+
+    <!-- Chat toggle button -->
+    <button class="chat-toggle">
+      <img src="{{ url_for('static', filename='chat-icon.png') }}"
+           alt="Chat with DSV" />
+    </button>
+
+    <!-- Chat widget -->
+    <div class="chat-box" id="chat-box">
+      <div class="chat-header">
+        <span>DSV Assistant</span>
+        <button id="chat-close">&times;</button>
+      </div>
+      <div class="chat-messages" id="chat-messages"></div>
+      <div class="chat-footer">
+        <input id="chat-input" type="text" placeholder="Type your message…" />
+        <button id="chat-send">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chat logic -->
+  <script src="{{ url_for('static', filename='chatbot.js') }}"></script>
+
+  <!-- (kept exactly as you had it) demo block -->
+  <div class="chat-window">
+    <div class="message bot">
+      <div class="message-text">DSV operates a large fleet in the UAE including:
+- 🛻 Flatbed trailers
+- 📦 Box trucks
+- 🚚 Double trailers
+- ❄️ Reefer trucks (chiller/freezer)
+- 🏗️ Lowbeds
+- 🪣 Tippers
+- 🚐 Small city delivery trucks
+
+Fleet vehicles support all types of transport including full truckload (FTL), LTL, and container movements.</div>
+    </div>
+  </div>
+</body>
+</html>
