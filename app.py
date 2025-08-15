@@ -811,7 +811,7 @@ def _storage_rate_text_for_specific(stype):
 def _guess_storage_kind_from_text(text, history_anchor=""):
     s = f"{text} {history_anchor}".lower()
     if "chemical" in s or "haz" in s:
-        if re.search(r"\b(ac|a\.c\.|air ?cond)", s): return "Chemicals AC"
+        if re.search(r"\b(ac|a\.c\.|air ?cond)\b", s): return "Chemicals AC"
         if "dg" in s: return "Chemicals Non-AC (DG)"
         return "Chemicals Non-AC (Non-DG)"
     if "open yard" in s or "kizad" in s or "mussafah yard" in s:
@@ -841,6 +841,23 @@ def answer_storage_rate_intent(question, history_msgs):
     if spec:
         return spec
     return ""
+
+# ================== Fleet intent (NEW) ==================
+def answer_fleet_intent(question, history_msgs):
+    anchor = _history_text_for_query(history_msgs)
+    s = f"{question} {anchor}".lower()
+    if not re.search(r"\b(fleet|truck(?:s)? types?|vehicle(?:s)? types?|transport fleet|our fleet)\b", s):
+        return ""
+    return (
+        "DSV fleet summary:\n"
+        "• Flatbeds — general cargo & containers (≈22–25 tons)\n"
+        "• Lowbeds — heavy/oversized machinery (up to ≈60 tons)\n"
+        "• Tippers — bulk materials (≈15–20 tons)\n"
+        "• Box trucks — weather-protected goods (≈5–10 tons)\n"
+        "• Reefer trucks — +2°C to –22°C cold chain (≈3–12 tons)\n"
+        "• Double trailers — high-volume long-haul (≈50–60 tons total)\n"
+        "• Small city trucks — last-mile (≈1–3 tons)"
+    )
 
 # ================== Hybrid retrieval & chat ==================
 def _tokenize(s: str):
@@ -898,7 +915,8 @@ def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str
     context="\n\n---\n\n".join(blocks) if blocks else "No project context found."
 
     system=("You are DSV’s project assistant. Use conversation history to resolve follow-ups. "
-            "Answer from the project context. If the context doesn’t contain the answer, say so briefly.")
+            "Answer from the project context. If you say 'summary', follow it with bullet points. "
+            "If the context doesn’t contain the answer, say so briefly.")
     msgs = [{"role":"system","content":system}]
     for m in history_msgs[-MAX_TURNS:]:
         msgs.append({"role": m["role"], "content": m["content"]})
@@ -922,6 +940,7 @@ def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str
 def _llm_general_answer(question: str, history_msgs: list) -> str:
     client=OpenAI()
     system=("You are a helpful logistics assistant. Use the prior conversation to keep topic continuity. "
+            "If you say 'summary', follow it with bullet points. "
             "Answer accurately and concisely. If unsure, say you are unsure.")
     msgs=[{"role":"system","content":system}]
     for m in history_msgs[-MAX_TURNS:]:
@@ -951,23 +970,24 @@ def _is_nonanswer(text: str) -> bool:
 def _smart_answer(question: str, history_msgs: list) -> str:
     if not os.getenv("OPENAI_API_KEY"):
         return ("AI answers are disabled because OPENAI_API_KEY is not set.")
-    # 0) NEW: deterministic storage-rate intent (fast + correct)
-    pre = answer_storage_rate_intent(question, history_msgs)
+    # NEW: fast deterministic intents first
+    pre = (
+        answer_fleet_intent(question, history_msgs) or
+        answer_storage_rate_intent(question, history_msgs)
+    )
     if pre:
         return pre
 
-    # 1) retrieval uses recent topic
+    # retrieval uses recent topic
     anchor = _history_text_for_query(history_msgs)
     query_for_retrieval = question if not anchor else f"{question}\n\nRecent topic: {anchor}"
     ctx=_retrieve_ctx(query_for_retrieval)
 
-    # 2) if no strong context
     if not _has_strong_ctx(ctx, question):
         if STRICT_LOCAL:
             return "I don’t have this in your saved files."
         return _llm_general_answer(question, history_msgs)
 
-    # 3) answer from files + history
     ans = _answer_with_ctx(question, ctx, history_msgs)
     if _is_nonanswer(ans):
         if STRICT_LOCAL:
