@@ -24,6 +24,8 @@ CHUNK_OVERLAP   = 200
 TOP_K           = 6
 MAX_CONTEXT_CHARS = 12000
 # ================================================================
+RAG_VECTORS = np.zeros((0, 1536), dtype=np.float32)
+RAG_META = []
 
 app = Flask(__name__)
 
