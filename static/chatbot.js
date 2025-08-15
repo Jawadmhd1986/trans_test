@@ -17,6 +17,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const inputEl    = document.getElementById('chat-input');
   const msgsEl     = document.getElementById('chat-messages');
 
+  // Preferred endpoints (AI+RAG first, then legacy rules)
+  const AI_ENDPOINT     = '/smart_chat';
+  const LEGACY_ENDPOINT = '/chat';
+
   chatToggle.addEventListener('click', () => chatBox.classList.toggle('open'));
   chatClose .addEventListener('click', () => chatBox.classList.remove('open'));
   sendBtn   .addEventListener('click', sendMessage);
@@ -34,16 +38,34 @@ document.addEventListener('DOMContentLoaded', () => {
     inputEl.value = '';
 
     try {
-      const res = await fetch('/chat', {
+      // Try smart AI endpoint first
+      let reply = await askServer(AI_ENDPOINT, text);
+
+      // Auto–fallback to legacy rules if AI is disabled/quota exceeded/404/etc.
+      if (!reply || /AI answers are disabled|quota exceeded|not found/i.test(reply)) {
+        reply = await askServer(LEGACY_ENDPOINT, text);
+      }
+
+      appendMessage('bot', reply ?? 'Sorry, something went wrong.', true);
+    } catch {
+      appendMessage('bot', 'Sorry, something went wrong.');
+    }
+  }
+
+  async function askServer(endpoint, text) {
+    try {
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text })
       });
-      const data = await res.json();
-      const reply = data.reply ?? 'Sorry, something went wrong.';
-      appendMessage('bot', reply, true); // typewriter with links
+      // Non-2xx may still return JSON; try to parse
+      let data;
+      try { data = await res.json(); } catch { data = {}; }
+      const reply = data.reply ?? (await res.text?.()) ?? '';
+      return String(reply || '').trim();
     } catch {
-      appendMessage('bot', 'Sorry, something went wrong.');
+      return '';
     }
   }
 
@@ -75,28 +97,22 @@ document.addEventListener('DOMContentLoaded', () => {
         el.innerHTML += part;
         pIndex++;
         cIndex = 0;
-        // keep scrolling
         msgsEl.scrollTop = msgsEl.scrollHeight;
         setTimeout(step, speed);
       } else {
         // type text content character-by-character
         if (cIndex <= part.length) {
-          // build current typed HTML: existing + current text slice
-          const typed = part.slice(0, cIndex);
-          // replace last text chunk only by rebuilding innerHTML up to now
-          // easier: append progressively
-          // remove previously appended typed piece for this text part by using a span
           if (!el.lastChild || el.lastChild.nodeName !== 'SPAN' || !el.lastChild.classList.contains('tw')) {
             const span = document.createElement('span');
             span.className = 'tw';
             el.appendChild(span);
           }
-          el.lastChild.textContent = typed;
+          el.lastChild.textContent = part.slice(0, cIndex);
           msgsEl.scrollTop = msgsEl.scrollHeight;
           cIndex++;
           setTimeout(step, speed);
         } else {
-          // finish this text part: keep as plain text node (replace span with text)
+          // finish this text part: replace typing span with a plain text node
           const span = el.lastChild;
           if (span && span.classList && span.classList.contains('tw')) {
             const txt = document.createTextNode(span.textContent);
@@ -123,13 +139,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (sender === 'bot' && typewriter) {
       const safeHTML = renderWithLinksAndBreaks(text);
-      // start blank and type it out
       bubble.innerHTML = '';
       typeHTML(safeHTML, bubble, 15);
       return;
     }
 
-    // user or non-typewriter bot
-    bubble.textContent = text; // preserves \n for user; CSS handles it
+    bubble.textContent = text; // user or non-typewriter bot
   }
 });
