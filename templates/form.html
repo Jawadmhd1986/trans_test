@@ -38,10 +38,12 @@
                 <option>Open Yard – Mussafah (Open Yard)</option>
                 <option>Open Yard – Mussafah (Open Yard Shed)</option>
                 <option>Open Yard – Mussafah (Jumbo Bag)</option>
+                <!-- RMS option -->
+                <option>RMS</option>
               </select>
             </div>
 
-            <div class="item-row">
+            <div class="item-row volume-row">
               <label>Volume (CBM or SQM)</label>
               <input type="number" step="0.01" name="volume" required />
             </div>
@@ -57,6 +59,18 @@
                 <option>Yes</option>
                 <option>No</option>
               </select>
+            </div>
+
+            <!-- RMS sub-panel (hidden unless Storage Type = RMS) -->
+            <div class="rms-sub" style="display:none; margin-top:.6rem; padding:.6rem; border:1px solid #CBD5E1; border-radius:8px; background:#F8FAFC;">
+              <label>RMS Facility</label>
+              <select name="rms_tier">
+                <option value="Premium FM200 Archiving AC Facility">Premium FM200 Archiving AC Facility</option>
+                <option value="Normal AC Facility">Normal AC Facility</option>
+              </select>
+
+              <label style="margin-top:.5rem;">Qty of Boxes</label>
+              <input type="number" name="rms_boxes" min="0" step="1" placeholder="e.g., 100" />
             </div>
 
             <button type="button" class="btn-remove" style="display:none">Remove</button>
@@ -90,47 +104,112 @@
   <!-- Chat logic (unchanged) -->
   <script src="{{ url_for('static', filename='chatbot.js') }}"></script>
 
-  <!-- Clone/remove storage items -->
+  <!-- Clone/remove storage items + Yard/RMS WMS rules -->
   <script>
-    (function () {
-      const container = document.getElementById("storage-items");
-      const addBtn = document.getElementById("add-item");
+  (function () {
+    const container = document.getElementById("storage-items");
+    const addBtn = document.getElementById("add-item");
 
-      function wireRemove(btn) {
-        btn.addEventListener("click", () => {
-          const block = btn.closest(".storage-item");
-          block.remove();
-          // Ensure the very first block has no Remove button
-          [...container.querySelectorAll(".storage-item")].forEach((blk, i) => {
-            const b = blk.querySelector(".btn-remove");
-            if (b) b.style.display = i === 0 ? "none" : "inline-block";
-          });
-        });
+    function isOpenYard(val) {
+      return /open yard/i.test(val || "");
+    }
+    function isRMS(val) {
+      return /^rms$/i.test((val || "").trim());
+    }
+
+    function applyRules(block) {
+      const typeSel = block.querySelector('select[name="storage_type"]');
+      const wmsSel  = block.querySelector('select[name="wms"]');
+      const rmsBox  = block.querySelector('.rms-sub');
+      const volRow  = block.querySelector('.volume-row');
+      const rmsQty  = block.querySelector('input[name="rms_boxes"]');
+
+      if (!typeSel || !wmsSel) return;
+
+      if (isOpenYard(typeSel.value)) {
+        // Open Yard: force OFF and lock
+        wmsSel.value = "No";
+        wmsSel.disabled = true;
+        if (rmsBox) rmsBox.style.display = "none";
+        if (volRow) {
+          volRow.style.display = "";
+          const volInput = volRow.querySelector('input[name="volume"]');
+          if (volInput) volInput.required = true;
+        }
+        if (rmsQty) rmsQty.required = false;
+
+      } else if (isRMS(typeSel.value)) {
+        // RMS: force ON and lock + show RMS details; hide normal Volume
+        wmsSel.value = "Yes";
+        wmsSel.disabled = true;
+        if (rmsBox) rmsBox.style.display = "block";
+        if (rmsQty) rmsQty.required = true;
+        if (volRow) {
+          volRow.style.display = "none";
+          const volInput = volRow.querySelector('input[name="volume"]');
+          if (volInput) volInput.required = false;
+        }
+
+      } else {
+        // Other storage: user controls WMS; hide RMS panel; show Volume
+        wmsSel.disabled = false;
+        if (rmsBox) rmsBox.style.display = "none";
+        if (rmsQty) rmsQty.required = false;
+        if (volRow) {
+          volRow.style.display = "";
+          const volInput = volRow.querySelector('input[name="volume"]');
+          if (volInput) volInput.required = true;
+        }
       }
+    }
 
-      addBtn.addEventListener("click", () => {
-        const first = container.querySelector(".storage-item");
-        const clone = first.cloneNode(true);
-
-        // reset all inputs/selects inside the clone
-        clone.querySelectorAll("input").forEach(i => (i.value = ""));
-        clone.querySelectorAll("select").forEach(s => (s.selectedIndex = 0));
-
-        // show remove button on clones
-        const rm = clone.querySelector(".btn-remove");
-        rm.style.display = "inline-block";
-        wireRemove(rm);
-
-        container.appendChild(clone);
-
-        // keep first block's remove hidden
-        const firstRm = first.querySelector(".btn-remove");
-        if (firstRm) firstRm.style.display = "none";
+    function wireRemove(btn) {
+      btn.addEventListener("click", () => {
+        const block = btn.closest(".storage-item");
+        block.remove();
+        // Hide remove button on the (new) first block
+        [...container.querySelectorAll(".storage-item")].forEach((blk, i) => {
+          const b = blk.querySelector(".btn-remove");
+          if (b) b.style.display = i === 0 ? "none" : "inline-block";
+        });
       });
+    }
 
-      // wire the initial (hidden) remove button for future visibility changes
-      wireRemove(container.querySelector(".storage-item .btn-remove"));
-    })();
+    addBtn.addEventListener("click", () => {
+      const first = container.querySelector(".storage-item");
+      const clone = first.cloneNode(true);
+
+      // reset values in clone
+      clone.querySelectorAll("input").forEach(i => (i.value = ""));
+      clone.querySelectorAll("select").forEach(s => (s.selectedIndex = 0));
+
+      // show remove on clones
+      const rm = clone.querySelector(".btn-remove");
+      rm.style.display = "inline-block";
+      wireRemove(rm);
+
+      container.appendChild(clone);
+
+      // make sure first block's remove stays hidden
+      const firstRm = first.querySelector(".btn-remove");
+      if (firstRm) firstRm.style.display = "none";
+
+      // apply rules to the new block (default state)
+      applyRules(clone);
+    });
+
+    // Delegate change: storage type -> apply rules
+    container.addEventListener("change", (e) => {
+      if (e.target && e.target.name === "storage_type") {
+        const block = e.target.closest(".storage-item");
+        applyRules(block);
+      }
+    });
+
+    // initial wiring and rules
+    wireRemove(container.querySelector(".storage-item .btn-remove"));
+    container.querySelectorAll(".storage-item").forEach(applyRules);
+  })();
   </script>
 </body>
 </html>
