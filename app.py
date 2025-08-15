@@ -7,6 +7,24 @@ from datetime import datetime
 import pandas as pd
 from copy import deepcopy
 
+# ==== AI / RAG imports & config (smart /smart_chat endpoint) ====
+import json, hashlib, fnmatch
+import numpy as np
+from pathlib import Path
+from openai import OpenAI
+
+AI_MODEL = os.getenv("AI_CHAT_MODEL", "gpt-4o-mini")
+EMB_MODEL = os.getenv("AI_EMB_MODEL", "text-embedding-3-small")
+RAG_INDEX_PATH = Path("rag_index.npz")
+RAG_META_PATH  = Path("rag_index_meta.json")
+RAG_FOLDERS = [".", "templates", "static", "generated"]
+RAG_GLOBS = ["*.py","*.js","*.ts","*.html","*.css","*.txt","*.md","*.docx","*.xlsx"]
+CHARS_PER_CHUNK = 1200
+CHUNK_OVERLAP   = 200
+TOP_K           = 6
+MAX_CONTEXT_CHARS = 12000
+# ================================================================
+
 app = Flask(__name__)
 
 # ---------- Excel matrix ----------
@@ -18,13 +36,13 @@ def _is_num(x):
 def _daily_rate_from_row(df, r, from_col=2, to_col=3):
     candidates, fallback = [], []
     for c in range(df.shape[1]):
-        if c in (from_col, to_col):  # skip the From/To columns
+        if c in (from_col, to_col):
             continue
         v = df.iat[r, c]
         if _is_num(v):
             v = float(v)
             if 1.2 <= v <= 10.0:
-                candidates.append(v)   # likely CBM/day
+                candidates.append(v)
             elif v > 0:
                 fallback.append(v)
     if candidates:
@@ -80,6 +98,7 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
         bands = MATRIX[family]["lt1m"] if period_lt_1m else MATRIX[family]["ge1m"]
         rate = _pick_rate(bands, volume)
         storage_fee = volume * days * rate
+
     elif st == "Chemicals AC":
         rate = 3.5; storage_fee = volume * days * rate
     elif st == "Chemicals Non-AC (Non-DG)":
@@ -88,6 +107,7 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
         rate = 3.0; storage_fee = volume * days * rate
     elif st == "Chemicals Non-AC":
         rate = 2.5; storage_fee = volume * days * rate
+
     elif "open yard – kizad" in st_lower:
         rate, unit, rate_unit = 125.0, "SQM", "SQM / YEAR"
         storage_fee = volume * days * (rate / 365.0)
@@ -101,8 +121,18 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
         unit, rate_unit, rate = "BAG", "BAG / MONTH", 19.0
         storage_fee = volume * days * (rate / 30.0)
 
+    # >>> RMS: Premium & Normal
+    elif st.startswith("RMS — Premium"):
+        unit, rate_unit, rate = "BOX", "BOX / MONTH", 5.0
+        storage_fee = volume * days * (rate / 30.0)
+    elif st.startswith("RMS — Normal"):
+        unit, rate_unit, rate = "BOX", "BOX / MONTH", 3.0
+        storage_fee = volume * days * (rate / 30.0)
+
+    # WMS
     is_open_yard = "open yard" in st_lower
-    is_chemical = "chemical" in st_lower
+    is_chemical  = "chemical"  in st_lower
+    is_rms       = st_lower.startswith("rms")
     months = max(1, days // 30)
     wms_monthly = 625 if is_chemical else 1500
     wms_fee = 0 if is_open_yard or not include_wms else wms_monthly * months
@@ -114,6 +144,7 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
         "months": months, "wms_fee": int(0 if is_open_yard or not include_wms else wms_monthly * months),
         "category_standard": st in ("AC", "Non-AC", "Open Shed"),
         "category_chemical": is_chemical, "category_openyard": is_open_yard,
+        "category_rms": is_rms,  # >>> RMS: flag
         "commodity": (commodity or "").strip(),
     }
 
@@ -121,7 +152,7 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
 def _clean_commodity(val: str) -> str:
     s = (val or "").strip()
     if not s: return ""
-    if re.fullmatch(r"\d+(\.\d+)?", s):  # numeric-only noise
+    if re.fullmatch(r"\d+(\.\d+)?", s):
         return ""
     return s
 
@@ -173,40 +204,29 @@ def _is_vas_table(tbl):
     return ("vas" in hdr and "price" in hdr) or ("main activity" in hdr and "transaction" in hdr)
 
 def _purge_all_vas_tables_and_headings(doc):
-    # remove headings
     for p in list(doc.paragraphs):
-        if (p.text or "").strip() in ("Standard VAS", "Chemical VAS", "Open Yard VAS",
-                                      "Terms & Conditions — Chemical", "Terms & Conditions — Open Yard"):
+        t = (p.text or "").strip()
+        if t in ("Standard VAS", "Chemical VAS", "Open Yard VAS",
+                 "Terms & Conditions — Chemical", "Terms & Conditions — Open Yard",
+                 "Value Added Service Rates (Standard VAS)", "Value Added Service Rates",
+                 "RMS VAS", "Terms & Conditions — RMS"):
             el = p._element; pa = el.getparent()
             if pa is not None: pa.remove(el)
-    # remove vas-like tables
     for tbl in list(doc.tables):
         if _is_vas_table(tbl):
             el = tbl._element; pa = el.getparent()
             if pa is not None: pa.remove(el)
 
-def _append_vas_heading_and_blocks(blocks, heading_text):
-    # Return a list of elements [blank, heading_p, ...blocks...]
-    out = []
-    p = Document().add_paragraph()._element  # harmless blank paras are tricky; will use one blank paragraph later
-    # create heading paragraph
-    tmp = Document()
-    hp = tmp.add_paragraph(heading_text)
-    hp.runs[0].bold = True
-    out.append(deepcopy(hp._element))
-    out.extend(blocks)
-    return out
-
 def _vas_blocks_from_template(path, start_tag, end_tag, heading):
     src = Document(path)
     blocks = _copy_blocks_between_markers(src, start_tag, end_tag)
     if blocks:
-        return _append_vas_heading_and_blocks(blocks, heading)
-    # fallback: take first VAS-like table if tags are missing
+        tmp = Document(); hp = tmp.add_paragraph(heading); hp.runs[0].bold = True
+        return [deepcopy(hp._element)] + blocks
     for tbl in src.tables:
         if _is_vas_table(tbl):
-            tmp = Document(); h = tmp.add_paragraph(heading); h.runs[0].bold = True
-            return [deepcopy(h._element), deepcopy(tbl._element)]
+            tmp = Document(); hp = tmp.add_paragraph(heading); hp.runs[0].bold = True
+            return [deepcopy(hp._element), deepcopy(tbl._element)]
     return []
 
 def _find_para_el_contains(doc, needle):
@@ -215,28 +235,13 @@ def _find_para_el_contains(doc, needle):
             return p._element
     return None
 
-def _insert_blocks_after(doc, ref_el, blocks):
+def _move_element_after(doc, moving_el, after_el):
+    if moving_el is None or after_el is None: return
     body = doc._element.body
-    idx = body.index(ref_el)
-    for i, el in enumerate(blocks):
-        body.insert(idx + 1 + i, el)
-
-def _append_terms_from_template(path, terms_heading="Storage Terms and Conditions:",
-                                end_markers=("Validity:", "We trust that")):
-    src = Document(path)
-    body = _body_children(src)
-    start_i = None
-    for i, el in enumerate(body):
-        if el.tag.endswith("p") and terms_heading.lower() in _el_text(el).lower():
-            start_i = i; break
-    if start_i is None: return []
-    end_i = len(body)
-    for j in range(start_i + 1, len(body)):
-        if body[j].tag.endswith("p"):
-            txt = _el_text(body[j]).strip()
-            if any(m.lower() in txt.lower() for m in end_markers):
-                end_i = j; break
-    return [deepcopy(el) for el in body[start_i + 1:end_i]]
+    par = moving_el.getparent()
+    if par is not None: par.remove(moving_el)
+    idx = body.index(after_el)
+    body.insert(idx + 1, moving_el)
 
 def _set_table_line_spacing(table, rule=WD_LINE_SPACING.ONE_POINT_FIVE):
     for row in table.rows:
@@ -265,28 +270,77 @@ def _rebuild_quotation_table(doc, items, grand_total):
             r[2].text = f"{it['wms_fee']:,.2f} AED"
 
     total_row = qt.add_row().cells
-    total_row[0].text = "Total Fee"
-    total_row[1].text = ""
-    total_row[2].text = f"{grand_total:,.2f} AED"
+    total_row[0].text = "Total Fee"; total_row[1].text = ""; total_row[2].text = f"{grand_total:,.2f} AED"
     for p in total_row[0].paragraphs:
-        for run in p.runs:
-            run.bold = True; run.font.size = Pt(11)
+        for run in p.runs: run.bold = True; run.font.size = Pt(11)
     for p in total_row[2].paragraphs:
-        for run in p.runs:
-            run.bold = True; run.font.size = Pt(11)
+        for run in p.runs: run.bold = True; run.font.size = Pt(11)
     _set_table_line_spacing(qt, WD_LINE_SPACING.ONE_POINT_FIVE)
+    return qt
 
 def _delete_summary_lines_for_multi(doc):
     targets = ("Storage Period:", "Storage Size:",
                "We trust that the rates", "Yours Faithfully", "DSV Solutions PJSC", "Validity:")
     to_remove = []
     for p in doc.paragraphs:
-        t = (p.text or "").strip()
-        if any(t.lower().startswith(x.lower()) for x in targets):
+        t = (p.text or "").strip().lower()
+        if any(t.startswith(x.lower()) for x in targets) or "value added service rates" in t:
             to_remove.append(p)
-    for p in to_remove:
+    for p in set(to_remove):
         el = p._element; pa = el.getparent()
         if pa is not None: pa.remove(el)
+
+# ---- Terms & Conditions helpers ----
+def _append_terms_from_template(path,
+                                terms_heading="Storage Terms and Conditions:",
+                                end_markers=("Validity:", "We trust that")):
+    src = Document(path)
+    body = _body_children(src)
+    start_i = None
+    for i, el in enumerate(body):
+        if el.tag.endswith("p") and terms_heading.lower() in _el_text(el).lower():
+            start_i = i; break
+    if start_i is None: return []
+    end_i = len(body)
+    for j in range(start_i + 1, len(body)):
+        if body[j].tag.endswith("p"):
+            txt = _el_text(body[j]).strip()
+            if any(m.lower() in txt.lower() for m in end_markers):
+                end_i = j; break
+    return [deepcopy(el) for el in body[start_i + 1:end_i]]
+
+def _remove_base_terms(doc, terms_heading="Storage Terms and Conditions:"):
+    body = _body_children(doc)
+    start_i = None
+    for i, el in enumerate(body):
+        if el.tag.endswith('p') and terms_heading.lower() in _el_text(el).lower():
+            start_i = i; break
+    if start_i is None: return
+    for j in range(len(body) - 1, start_i - 1, -1):
+        parent = body[j].getparent()
+        if parent is not None:
+            parent.remove(body[j])
+
+def _strip_marker_text(doc):
+    tags = ["[VAS_STANDARD]", "[/VAS_STANDARD]",
+            "[VAS_CHEMICAL]", "[/VAS_CHEMICAL]",
+            "[VAS_OPENYARD]", "[/VAS_OPENYARD]",
+            "[VAS_RMS]", "[/VAS_RMS]"]  # >>> RMS tags too
+    for p in doc.paragraphs:
+        t = p.text or ""; new = t
+        for tg in tags: new = new.replace(tg, "")
+        if new != t:
+            for r in p.runs: r.text = ""
+            p.add_run(new)
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    t = p.text or ""; new = t
+                    for tg in tags: new = new.replace(tg, "")
+                    if new != t:
+                        for r in p.runs: r.text = ""
+                        p.add_run(new)
 
 # ---------- ROUTE: generate ----------
 @app.route("/generate", methods=["POST"])
@@ -296,23 +350,93 @@ def generate():
     days_list     = request.form.getlist("days")         or [request.form.get("days", 0)]
     wms_list      = request.form.getlist("wms")          or [request.form.get("wms", "No")]
     commodities_raw = request.form.getlist("commodity") or [request.form.get("commodity", "")]
-    canonical_commodity = next((c for c in ( _clean_commodity(v) for v in commodities_raw ) if c), "")
+    canonical_commodity = next((c for c in (_clean_commodity(v) for v in commodities_raw) if c), "")
+
+    # >>> RMS: read facility tier & box qty lists (may be absent for non-RMS)
+    rms_tier_list  = request.form.getlist("rms_tier")  or []
+    rms_boxes_list = request.form.getlist("rms_boxes") or []
 
     n = max(len(storage_types), len(volumes), len(days_list), len(wms_list))
     storage_types += [""] * (n - len(storage_types))
     volumes       += [0]  * (n - len(volumes))
     days_list     += [0]  * (n - len(days_list))
     wms_list      += ["No"] * (n - len(wms_list))
+    # pad RMS lists
+    if len(rms_tier_list)  < n: rms_tier_list  += [""] * (n - len(rms_tier_list))
+    if len(rms_boxes_list) < n: rms_boxes_list += ["0"] * (n - len(rms_boxes_list))
 
     items = []
     for i in range(n):
-        st  = storage_types[i]
+        raw_st = storage_types[i]
         vol = float(volumes[i] or 0)
         d   = int(days_list[i] or 0)
         inc = (wms_list[i] == "Yes")
         com = _clean_commodity(commodities_raw[i] if i < len(commodities_raw) else "") or canonical_commodity
-        if not st: continue
-        items.append(compute_item(st, vol, d, inc, com))
+
+        st_lower = (raw_st or "").strip().lower()
+        # >>> RMS: override label, volume (as boxes), and WMS
+        if st_lower == "rms":
+            tier = (rms_tier_list[i] or "").strip()
+            if "premium" in tier.lower():
+                st_label = "RMS — Premium FM200 Archiving AC Facility"
+            else:
+                st_label = "RMS — Normal AC Facility"
+            vol = float(rms_boxes_list[i] or 0)  # boxes
+            inc = True  # WMS always ON for RMS
+            items.append(compute_item(st_label, vol, d, inc, com))
+            continue
+
+        # open yard safety: force WMS off
+        if "open yard" in st_lower:
+            inc = False
+
+        if not raw_st:
+            continue
+        items.append(compute_item(raw_st, vol, d, inc, com))
+    # --- WMS aggregation rules for RMS combos ---
+    if len(items) > 1:
+        has_rms  = any(it.get("category_rms") for it in items)
+        has_std  = any(it.get("category_standard") for it in items)
+        has_chem = any(it.get("category_chemical") for it in items)
+
+        def _max_months(filter_fn):
+            vals = [it["months"] for it in items if filter_fn(it)]
+            return max(vals) if vals else 0
+
+        if has_rms and has_std and not has_chem:
+            months_agg = max(
+                _max_months(lambda x: x.get("category_rms")),
+                _max_months(lambda x: x.get("category_standard") and x.get("include_wms"))
+            ) or _max_months(lambda x: x.get("category_rms")) or 1
+            for it in items:
+                if it.get("category_rms") or (it.get("category_standard") and it.get("include_wms")):
+                    it["wms_fee"] = 0
+                    it["include_wms"] = False
+            carrier = next((it for it in items if it.get("category_rms")), items[0])
+            carrier["include_wms"] = True
+            carrier["wms_monthly"] = 1500
+            carrier["months"] = months_agg
+            carrier["wms_fee"] = 1500 * months_agg
+
+        elif has_rms and has_chem:
+            rms_months  = _max_months(lambda x: x.get("category_rms")) or 1
+            chem_months = _max_months(lambda x: x.get("category_chemical")) or 1
+            for it in items:
+                if it.get("category_rms") or it.get("category_chemical"):
+                    it["wms_fee"] = 0
+                    it["include_wms"] = False
+            rms_carrier = next((it for it in items if it.get("category_rms")), items[0])
+            rms_carrier["include_wms"] = True
+            rms_carrier["wms_monthly"] = 1500
+            rms_carrier["months"] = rms_months
+            rms_carrier["wms_fee"] = 1500 * rms_months
+            chem_carrier = next((it for it in items if it.get("category_chemical")), None)
+            if chem_carrier:
+                chem_carrier["include_wms"] = True
+                chem_carrier["wms_monthly"] = 625
+                chem_carrier["months"] = chem_months
+                chem_carrier["wms_fee"] = 625 * chem_months
+
     if not items:
         items = [compute_item("AC", 0.0, 0, False)]
 
@@ -322,6 +446,7 @@ def generate():
         st0 = items[0]["storage_type"].lower()
         if "chemical" in st0: template_path = "templates/Chemical VAS.docx"
         elif "open yard" in st0: template_path = "templates/Open Yard VAS.docx"
+        elif st0.startswith("rms"): template_path = "templates/RMS VAS.docx"
         else: template_path = "templates/Standard VAS.docx"
     else:
         template_path = "templates/Standard VAS.docx"
@@ -333,8 +458,7 @@ def generate():
 
     if len(items) == 1:
         one = items[0]
-        unit_for_display = one["unit"]
-        unit_rate_text   = f"{one['rate']:.2f} AED / {one['rate_unit']}"
+        unit_for_display = one["unit"]; unit_rate_text = f"{one['rate']:.2f} AED / {one['rate_unit']}"
         wms_status = "" if one["category_openyard"] else ("INCLUDED" if one["include_wms"] else "NOT INCLUDED")
         storage_type_text = one["storage_type"]; days_text = str(one["days"]); volume_text = str(one["volume"])
         commodity_text = one.get("commodity") or canonical_commodity or "N/A"
@@ -345,13 +469,11 @@ def generate():
             dur = f"{it['days']} day{'s' if it['days'] != 1 else ''}"
             st_lines.append(f"{it['storage_type']} ({qty} × {dur})")
         storage_type_text = "\n".join(st_lines)
-
         cm_lines = []
         for it in items:
             cm = it.get("commodity") or canonical_commodity or "N/A"
             cm_lines.append(f"{it['storage_type']} — {cm}")
         commodity_text = "\n".join(cm_lines)
-
         unit_for_display = ""; unit_rate_text = "—"
         days_text = "VARIOUS"; volume_text = "VARIOUS"
         wms_status = "SEE BREAKDOWN"
@@ -382,25 +504,27 @@ def generate():
 
     replace_all(doc, placeholders)
 
-    # Remove bullets/closing for multi (we'll append custom at the end)
-    if len(items) > 1: _delete_summary_lines_for_multi(doc)
+    if len(items) > 1:
+        _delete_summary_lines_for_multi(doc)
+
+    qt = _rebuild_quotation_table(doc, items, grand_total)
 
     used_standard = any(i["category_standard"] for i in items)
     used_chemical = any(i["category_chemical"] for i in items)
     used_openyard = any(i["category_openyard"] for i in items)
+    used_rms      = any(i.get("category_rms") for i in items)
 
-    # ---------- VAS ORDER & PLACEMENT ----------
     if len(items) > 1:
-        # 1) Purge any VAS-like tables/headings present in base
         _purge_all_vas_tables_and_headings(doc)
 
-        # 2) Determine families in the EXACT order the user selected
         fam_order = []
         for it in items:
-            fam = "standard" if it["category_standard"] else ("chemical" if it["category_chemical"] else ("openyard" if it["category_openyard"] else None))
+            fam = ("rms" if it.get("category_rms") else
+                   "standard" if it["category_standard"] else
+                   "chemical" if it["category_chemical"] else
+                   "openyard" if it["category_openyard"] else None)
             if fam and fam not in fam_order: fam_order.append(fam)
 
-        # 3) Build blocks for each family (heading + table) in that order
         family_blocks = []
         for fam in fam_order:
             if fam == "standard" and used_standard:
@@ -409,47 +533,52 @@ def generate():
                 family_blocks += _vas_blocks_from_template("templates/Chemical VAS.docx", "[VAS_CHEMICAL]", "[/VAS_CHEMICAL]", "Chemical VAS")
             elif fam == "openyard" and used_openyard:
                 family_blocks += _vas_blocks_from_template("templates/Open Yard VAS.docx", "[VAS_OPENYARD]", "[/VAS_OPENYARD]", "Open Yard VAS")
+            elif fam == "rms" and used_rms:
+                family_blocks += _vas_blocks_from_template("templates/RMS VAS.docx", "[VAS_RMS]", "[/VAS_RMS]", "RMS VAS")
 
-        # 4) Insert VAS sequence RIGHT AFTER the "Note: Minimum Monthly storage charges" paragraph
-        anchor = _find_para_el_contains(doc, "Minimum Monthly storage charges")
-        if anchor is None:  # fallback: after "Storage Additional Fees"
-            anchor = _find_para_el_contains(doc, "Storage Additional Fees")
-        if anchor is None:  # if not found, append at end
-            _append_blocks(doc, family_blocks)
+        note_el = _find_para_el_contains(doc, "Minimum Monthly storage charges")
+        anchor = note_el if (note_el is not None and qt is not None) else (qt._element if qt is not None else None)
+        if note_el is not None and qt is not None:
+            _move_element_after(doc, note_el, qt._element)
+        if anchor is not None and family_blocks:
+            idx = doc._element.body.index(anchor)
+            for i, el in enumerate(family_blocks):
+                doc._element.body.insert(idx + 1 + i, el)
         else:
-            _insert_blocks_after(doc, anchor, family_blocks)
+            _append_blocks(doc, family_blocks)
 
-        # ---------- Combined Terms & Conditions at the end ----------
+        _remove_base_terms(doc)
+
         combined = []
-        if used_standard:
-            combined += _append_terms_from_template("templates/Standard VAS.docx")
-        if used_chemical:
-            combined += _append_terms_from_template("templates/Chemical VAS.docx")
-        if used_openyard:
-            combined += _append_terms_from_template("templates/Open Yard VAS.docx")
+        if used_standard: combined += _append_terms_from_template("templates/Standard VAS.docx")
+        if used_chemical: combined += _append_terms_from_template("templates/Chemical VAS.docx")
+        if used_openyard: combined += _append_terms_from_template("templates/Open Yard VAS.docx")
+        if used_rms:      combined += _append_terms_from_template("templates/RMS VAS.docx")
 
-        # De-duplicate; and handle the non-Haz line according to selection
         doc.add_paragraph(" ")
         h = doc.add_paragraph("Terms & Conditions — Combined"); h.runs[0].bold = True
+
         seen = set()
         non_haz_line = "The above rates offered are for non-Haz cargo."
         keep_non_haz = not any(it["storage_type"] == "Chemicals AC" for it in items)
 
         for el in combined:
-            text = _el_text(el).strip()
-            norm = re.sub(r"\s+", " ", text).strip().lower()
-            if not norm: continue
+            if not el.tag.endswith('p'):
+                continue
+            raw = _el_text(el).strip()
+            if not raw:
+                continue
+            norm = re.sub(r"\s+", " ", raw).strip().lower()
             if not keep_non_haz and non_haz_line.lower() in norm:
-                continue  # drop this line
-            if norm in seen: continue
+                continue
+            if norm in seen:
+                continue
             seen.add(norm)
             doc._element.body.append(deepcopy(el))
 
-        # if we should keep it and it wasn't present, add it once
-        if keep_non_haz and all(non_haz_line.lower() not in re.sub(r"\s+", " ", _el_text(el)).lower() for el in combined):
+        if keep_non_haz and non_haz_line.lower() not in seen:
             doc.add_paragraph(non_haz_line)
 
-        # Closing block at the very end
         doc.add_paragraph(" ")
         doc.add_paragraph("Validity: 15 Days")
         doc.add_paragraph("")
@@ -458,16 +587,169 @@ def generate():
         doc.add_paragraph("")
         doc.add_paragraph("DSV Solutions PJSC")
 
-    # Rebuild Quotation Details table (also sets 1.5 line spacing)
-    _rebuild_quotation_table(doc, items, grand_total)
+    _strip_marker_text(doc)
 
-    # Save
     os.makedirs("generated", exist_ok=True)
     filename = f"Quotation_{(request.form.get('commodity') or 'quotation').strip() or 'quotation'}.docx"
     output_path = os.path.join("generated", filename)
     doc.save(output_path)
     return send_file(output_path, as_attachment=True)
 
+# -------------------------- RULE-BASED /chat (UNCHANGED) --------------------------
+# (kept exactly as in your file so nothing breaks)
+# ... the entire long /chat route from your current app remains here ...
+# (for brevity, not repeated in this message; it’s already in your file) 
+# ----------------------------------------------------------------------------------
+
+# -------------------------- SMART /smart_chat (NEW) -------------------------------
+def _file_text_for_rag(p: Path) -> str:
+    # mirror _file_text but available regardless of local scope
+    suf = p.suffix.lower()
+    if suf in [".txt",".md",".py",".js",".ts",".html",".css"]:
+        try: return p.read_text(encoding="utf-8", errors="ignore")
+        except: return ""
+    if suf == ".docx":
+        try:
+            d = Document(str(p))
+            parts=[]
+            for para in d.paragraphs:
+                if para.text.strip():
+                    parts.append(para.text.strip())
+            for tbl in d.tables:
+                for row in tbl.rows:
+                    cells=[c.text.strip() for c in row.cells]
+                    if any(cells): parts.append(" | ".join(cells))
+            return "\n".join(parts)
+        except: return ""
+    if suf == ".xlsx":
+        try:
+            import pandas as pd
+            xls = pd.ExcelFile(str(p))
+            out=[]
+            for sh in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sh, header=None).astype(str)
+                out.append(f"### Sheet: {sh}")
+                out.append(df.head(200).to_csv(index=False, header=False))
+            return "\n".join(out)
+        except: return ""
+    return ""
+
+def _list_files_for_rag():
+    files=[]
+    for folder in RAG_FOLDERS:
+        base=Path(folder)
+        if not base.exists(): continue
+        for p in base.rglob("*"):
+            if p.is_file() and any(fnmatch.fnmatch(p.name,g) for g in RAG_GLOBS):
+                files.append(p)
+    seen=set(); uniq=[]
+    for p in files:
+        k=str(p.resolve())
+        if k not in seen:
+            seen.add(k); uniq.append(p)
+    return uniq
+
+def _build_or_load_index_rag():
+    if not os.getenv("OPENAI_API_KEY"):
+        return np.zeros((0,1536),dtype=np.float32), []
+    client=OpenAI()
+    files=_list_files_for_rag()
+    sig=[]
+    for p in files:
+        try: sig.append(f"{p}:{int(p.stat().st_mtime)}")
+        except: pass
+    signature=hashlib.md5("|".join(sorted(sig)).encode("utf-8")).hexdigest()
+    if RAG_INDEX_PATH.exists() and RAG_META_PATH.exists():
+        try:
+            saved=json.loads(RAG_META_PATH.read_text())
+            if saved.get("signature")==signature:
+                vecs=np.load(RAG_INDEX_PATH)["vectors"]
+                return vecs, saved["meta"]
+        except: pass
+    meta=[]; chunks=[]
+    for p in files:
+        txt=_file_text_for_rag(p)
+        if not txt: continue
+        i=0; n=len(txt)
+        while i<n:
+            j=min(n, i+CHARS_PER_CHUNK)
+            chunks.append(txt[i:j]); meta.append({"path":str(p), "text":txt[i:j]})
+            if j==n: break
+            i=max(0, j-CHUNK_OVERLAP)
+    if not chunks:
+        RAG_META_PATH.write_text(json.dumps({"signature":signature,"meta":[]}))
+        np.savez_compressed(RAG_INDEX_PATH, vectors=np.zeros((0,1536),dtype=np.float32))
+        return np.zeros((0,1536),dtype=np.float32), []
+    vecs=[]
+    B=64
+    for i in range(0,len(chunks),B):
+        emb=client.embeddings.create(model=EMB_MODEL, input=chunks[i:i+B])
+        vecs.extend([e.embedding for e in emb.data])
+    vecs=np.array(vecs,dtype=np.float32)
+    np.savez_compressed(RAG_INDEX_PATH, vectors=vecs)
+    RAG_META_PATH.write_text(json.dumps({"signature":signature,"meta":meta}))
+    return vecs, meta
+
+def _ensure_index():
+    global RAG_VECTORS, RAG_META
+    if RAG_VECTORS.shape[0]==0 or not RAG_META:
+        RAG_VECTORS, RAG_META = _build_or_load_index_rag()
+
+def _retrieve_ctx(q: str, top_k=TOP_K):
+    if RAG_VECTORS.shape[0]==0 or not RAG_META:
+        return []
+    client=OpenAI()
+    qemb=client.embeddings.create(model=EMB_MODEL, input=[q]).data[0].embedding
+    sims=(RAG_VECTORS/(np.linalg.norm(RAG_VECTORS,axis=1,keepdims=True)+1e-9)) @ \
+         (np.array(qemb,dtype=np.float32)/(np.linalg.norm(qemb)+1e-9))
+    idx=sims.argsort()[::-1][:top_k]
+    total=0; out=[]
+    for i in idx:
+        md=RAG_META[i]; out.append(md); total+=len(md["text"])
+        if total>=MAX_CONTEXT_CHARS: break
+    return out
+
+def _smart_answer(question: str) -> str:
+    if not os.getenv("OPENAI_API_KEY"):
+        return ("AI answers are disabled because OPENAI_API_KEY is not set. "
+                "Add it in your Render environment to enable the smart chatbot.")
+    _ensure_index()
+    ctx=_retrieve_ctx(question)
+    blocks=[]; seen=set()
+    for r in ctx:
+        p=r["path"]
+        if p not in seen:
+            seen.add(p)
+            blocks.append(f"Source: {p}\n{r['text']}")
+        else:
+            blocks.append(r["text"])
+    context="\n\n---\n\n".join(blocks) if blocks else "No project context found."
+    client=OpenAI()
+    system=("You are DSV’s project assistant. Answer clearly using the project context. "
+            "If the context doesn’t contain the answer, say so briefly.")
+    user=f"Question:\n{question}\n\nProject context:\n{context}"
+    resp=client.chat.completions.create(
+        model=AI_MODEL,
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content.strip()
+
+@app.route("/smart_chat", methods=["POST"])
+def smart_chat():
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    if not message:
+        return jsonify({"reply": "Hi! Ask me anything about this project—files, templates, rates, or how the app works."})
+    try:
+        return jsonify({"reply": _smart_answer(message)})
+    except Exception as e:
+        return jsonify({"reply": f"Sorry, an error occurred ({type(e).__name__})."}), 200
+# ----------------------------------------------------------------------------------
+
+# -------------------------- your existing /chat route remains below ---------------
+# (Left unchanged so your current UI keeps working. You can switch your frontend to
+#  /smart_chat when you’re ready for AI answers.)
 
 
 
@@ -808,7 +1090,7 @@ def chat():
 
     if match([r"open yard kizad", r"kizad open yard", r"rate.*kizad open yard", r"^kizad$"]):
         return jsonify({"reply": "Open Yard KIZAD storage is **125 AED/SQM/year**. WMS is excluded. For availability, contact Antony Jeyaraj at antony.jeyaraj@dsv.com."})
- 
+
     # General VAS prompt if user just says 'vas' / 'vas rates'
     if match([
         r"^vas$",
@@ -822,7 +1104,7 @@ def chat():
             "🟦 Type **Standard VAS** for AC/Non-AC/Open Shed\n"
             "🧪 Type **Chemical VAS** for hazmat/chemicals\n"
             "🏗 Type **Open Yard VAS** for forklifts/cranes"})
-    
+
 # --- VAS: Aggregate / Prompt ---
     if match([
     r"^all\s*vas(?:es)?\s*(rates|list)?$",
@@ -862,7 +1144,7 @@ def chat():
         "- Container Lifting: 250 AED/lift\n"
         "- Container Stripping (20ft): 1,200 AED/hr"
     })
-    
+
 # --- All Storage Rates at Once ---
     if ("value added services" not in message) and match([
     r"\ball\s+storage\s+rates?\b",
@@ -2058,7 +2340,7 @@ We manage everything from port-to-door, ensuring safety, compliance, and cost ef
         return jsonify({"reply":
             "🔒 **FM‑200 (HFC‑227ea)** is a clean‑agent fire suppression system used in sensitive areas (like RMS). "
             "It extinguishes fires quickly by absorbing heat, leaves no residue, and is safe for documents and electronics when applied per design."})
-        
+
     if match([r"summer break|midday break|working hours summer|12.*3.*break|uae heat ban|no work afternoon|hot season schedule"]):
         return jsonify({"reply": "DSV complies with UAE summer working hour restrictions. From June 15 to September 15, all outdoor work (including open yard and transport loading) is paused daily between 12:30 PM and 3:30 PM. This ensures staff safety and follows MOHRE guidelines."})
 
@@ -2076,7 +2358,7 @@ We manage everything from port-to-door, ensuring safety, compliance, and cost ef
         r"^services\??$",
         r"\bwhat\s+services\b",
         r"\bwhat\s*service\??$",
-        
+
     ]):
         return jsonify({"reply":
             "Sure! I can help you with:\n\n"
