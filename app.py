@@ -74,7 +74,7 @@ def _history_text_for_query(hist, max_chars=600):
 # ---------------- Flask ----------------
 app = Flask(__name__)
 
-# ================== Matrix / pricing helpers (unchanged) ==================
+# ================== Matrix / pricing helpers (unchanged core) ==================
 TARIFF_PATH = "CL TARIFF - 2025 v3 (004) - UPDATED 6TH AUGUST 2025.xlsx"
 
 def _is_num(x):
@@ -388,7 +388,7 @@ def _strip_marker_text(doc):
                         for r in p.runs: r.text = ""
                         p.add_run(new)
 
-# ---------------- ROUTE: generate (unchanged logic) ----------------
+# ---------------- ROUTE: generate (quotation) ----------------
 @app.route("/generate", methods=["POST"])
 def generate():
     storage_types = request.form.getlist("storage_type") or [request.form.get("storage_type", "")]
@@ -435,7 +435,7 @@ def generate():
             continue
         items.append(compute_item(raw_st, vol, d, inc, com))
 
-    # WMS aggregation for combos (same as your latest)
+    # WMS aggregation for combos (same as your latest logic)
     if len(items) > 1:
         has_rms  = any(it.get("category_rms") for it in items)
         has_std  = any(it.get("category_standard") for it in items)
@@ -754,6 +754,94 @@ def _ensure_index():
 # ==== Build index at process start (NOT per request) ====
 _ensure_index()
 
+# ================== Storage-rate intent (NEW) ==================
+def _fmt_num(x):
+    try:
+        if x == float("inf"): return "∞"
+        s = f"{float(x):g}"
+        return s
+    except Exception:
+        return str(x)
+
+def _format_bands(label, bands):
+    if not bands: return f"{label}: (no data)"
+    rows = []
+    for f, t, r in bands:
+        rows.append(f"• {_fmt_num(f)}–{_fmt_num(t)} CBM: {r:.2f} AED / CBM / DAY")
+    return f"{label}:\n" + "\n".join(rows)
+
+def _storage_rate_text_for_standard(kind):
+    family = "ac" if kind == "AC" else "dry"
+    try:
+        lt = MATRIX[family]["lt1m"]
+        ge = MATRIX[family]["ge1m"]
+    except Exception:
+        return ("I couldn't load the standard storage bands from the matrix. "
+                "Please ensure the Excel tariff file is present and readable.")
+    parts = [
+        f"Standard {kind} storage rates (AED / CBM / DAY):",
+        _format_bands("• Period < 30 days", lt),
+        _format_bands("• Period ≥ 30 days", ge),
+        "Note: The band applies based on your CBM and storage duration."
+    ]
+    return "\n".join(parts)
+
+def _storage_rate_text_for_specific(stype):
+    s = (stype or "").lower()
+    if s == "chemicals ac":
+        return "Chemicals AC storage: 3.50 AED / CBM / DAY."
+    if s in ("chemicals non-ac (non-dg)", "chemicals non-ac"):
+        return "Chemicals Non-AC (Non-DG) storage: 2.50 AED / CBM / DAY."
+    if s == "chemicals non-ac (dg)":
+        return "Chemicals Non-AC (DG) storage: 3.00 AED / CBM / DAY."
+    if "open yard – kizad" in s:
+        return "Open Yard – KIZAD: 125 AED / SQM / YEAR (pro-rata)."
+    if stype == "Open Yard – Mussafah (Open Yard)":
+        return "Open Yard – Mussafah (Open Yard): 15 AED / SQM / MONTH (pro-rata)."
+    if stype == "Open Yard – Mussafah (Open Yard Shed)":
+        return "Open Yard – Mussafah (Open Yard Shed): 35 AED / SQM / MONTH (pro-rata)."
+    if stype == "Open Yard – Mussafah (Jumbo Bag)":
+        return "Open Yard – Mussafah (Jumbo Bag): 19 AED / BAG / MONTH (pro-rata)."
+    if s.startswith("rms — premium"):
+        return "RMS — Premium AC archiving: 5.00 AED / BOX / MONTH."
+    if s.startswith("rms — normal"):
+        return "RMS — Normal AC archiving: 3.00 AED / BOX / MONTH."
+    return ""
+
+def _guess_storage_kind_from_text(text, history_anchor=""):
+    s = f"{text} {history_anchor}".lower()
+    if "chemical" in s or "haz" in s:
+        if re.search(r"\b(ac|a\.c\.|air ?cond)", s): return "Chemicals AC"
+        if "dg" in s: return "Chemicals Non-AC (DG)"
+        return "Chemicals Non-AC (Non-DG)"
+    if "open yard" in s or "kizad" in s or "mussafah yard" in s:
+        if "kizad" in s: return "Open Yard – KIZAD"
+        if "shed" in s:  return "Open Yard – Mussafah (Open Yard Shed)"
+        if "jumbo" in s: return "Open Yard – Mussafah (Jumbo Bag)"
+        return "Open Yard – Mussafah (Open Yard)"
+    if "rms" in s or "record management" in s or "archiv" in s:
+        if "premium" in s: return "RMS — Premium FM200 Archiving AC Facility"
+        return "RMS — Normal AC Facility"
+    if re.search(r"\b(ac|a\.c\.|air ?cond)\b", s): return "AC"
+    if re.search(r"\bnon[- ]?ac\b", s) or "dry" in s: return "Non-AC"
+    if "open shed" in s: return "Open Shed"
+    return None
+
+def answer_storage_rate_intent(question, history_msgs):
+    anchor = _history_text_for_query(history_msgs)
+    q = (question or "").lower()
+    if not re.search(r"\b(rate|price|tariff)\b", q) and "storage" not in q:
+        return ""
+    kind = _guess_storage_kind_from_text(question, anchor)
+    if not kind:
+        return ""
+    if kind in ("AC", "Non-AC", "Open Shed"):
+        return _storage_rate_text_for_standard(kind)
+    spec = _storage_rate_text_for_specific(kind)
+    if spec:
+        return spec
+    return ""
+
 # ================== Hybrid retrieval & chat ==================
 def _tokenize(s: str):
     return re.findall(r"[a-z0-9]+", (s or "").lower())
@@ -817,7 +905,6 @@ def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str
     msgs.append({"role":"system","content": f"Project context:\n{context}"} )
     msgs.append({"role":"user","content": question})
 
-    # keep replies short for speed
     resp=client.chat.completions.create(
         model=AI_MODEL,
         messages=msgs,
@@ -844,7 +931,7 @@ def _llm_general_answer(question: str, history_msgs: list) -> str:
         model=AI_MODEL,
         messages=msgs,
         temperature=0.2,
-        max_tokens=250   # shorter => faster
+        max_tokens=250
     )
     ans = resp.choices[0].message.content.strip()
     if TAG_SOURCES:
@@ -864,16 +951,23 @@ def _is_nonanswer(text: str) -> bool:
 def _smart_answer(question: str, history_msgs: list) -> str:
     if not os.getenv("OPENAI_API_KEY"):
         return ("AI answers are disabled because OPENAI_API_KEY is not set.")
-    # retrieval uses recent topic
+    # 0) NEW: deterministic storage-rate intent (fast + correct)
+    pre = answer_storage_rate_intent(question, history_msgs)
+    if pre:
+        return pre
+
+    # 1) retrieval uses recent topic
     anchor = _history_text_for_query(history_msgs)
     query_for_retrieval = question if not anchor else f"{question}\n\nRecent topic: {anchor}"
     ctx=_retrieve_ctx(query_for_retrieval)
 
+    # 2) if no strong context
     if not _has_strong_ctx(ctx, question):
         if STRICT_LOCAL:
             return "I don’t have this in your saved files."
         return _llm_general_answer(question, history_msgs)
 
+    # 3) answer from files + history
     ans = _answer_with_ctx(question, ctx, history_msgs)
     if _is_nonanswer(ans):
         if STRICT_LOCAL:
@@ -938,6 +1032,7 @@ def reindex():
     global RAG_VECTORS, RAG_META
     RAG_VECTORS = np.zeros((0,1536),dtype=np.float32)
     RAG_META = []
+    # build now
     _ensure_index()
     return jsonify({
         "ok": True,
