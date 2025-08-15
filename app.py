@@ -15,27 +15,29 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dsv-app")
 
 # ---------------- AI / RAG config ----------------
-AI_MODEL = os.getenv("AI_CHAT_MODEL", "gpt-4o-mini")
-EMB_MODEL = os.getenv("AI_EMB_MODEL", "text-embedding-3-small")
+AI_MODEL = os.getenv("AI_CHAT_MODEL", "gpt-4o-mini")            # fast model
+EMB_MODEL = os.getenv("AI_EMB_MODEL", "text-embedding-3-small") # fast embeddings
 RAG_INDEX_PATH = Path("rag_index.npz")
 RAG_META_PATH  = Path("rag_index_meta.json")
 
-RAG_FOLDERS = ["templates", "templates/chatbot", "static"]  # explicit chatbot folder
+# index scope (explicit chatbot folder included)
+RAG_FOLDERS = ["templates", "templates/chatbot", "static"]
 RAG_GLOBS = ["*.py","*.js","*.ts","*.html","*.css","*.txt","*.md","*.docx","*.xlsx","*.pdf"]
 EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", "generated"}
 
-CHARS_PER_CHUNK   = 1200
-CHUNK_OVERLAP     = 200
-TOP_K             = 12
-MAX_CONTEXT_CHARS = 16000
+# retrieval tuning (smaller = faster)
+CHARS_PER_CHUNK   = 900
+CHUNK_OVERLAP     = 150
+TOP_K             = 6
+MAX_CONTEXT_CHARS = 7000
 MAX_FILE_BYTES    = 1_500_000
 MAX_TOTAL_CHUNKS  = 4000
 EMBED_BATCH       = 32
-AI_DEBUG          = os.getenv("AI_DEBUG", "0") == "1"
 
-# Optional behavior toggles
-TAG_SOURCES       = os.getenv("TAG_SOURCES", "0") == "1"   # label replies with source class
-STRICT_LOCAL      = os.getenv("STRICT_LOCAL", "0") == "1"  # refuse if not in files
+# optional diagnostics / behavior
+AI_DEBUG          = os.getenv("AI_DEBUG", "0") == "1"     # add [Sources]
+TAG_SOURCES       = os.getenv("TAG_SOURCES", "0") == "1"  # label replies
+STRICT_LOCAL      = os.getenv("STRICT_LOCAL", "0") == "1" # refuse if not in files
 
 # pre-init to avoid NameError
 RAG_VECTORS = np.zeros((0, 1536), dtype=np.float32)
@@ -72,7 +74,7 @@ def _history_text_for_query(hist, max_chars=600):
 # ---------------- Flask ----------------
 app = Flask(__name__)
 
-# ================== Matrix / pricing helpers ==================
+# ================== Matrix / pricing helpers (unchanged) ==================
 TARIFF_PATH = "CL TARIFF - 2025 v3 (004) - UPDATED 6TH AUGUST 2025.xlsx"
 
 def _is_num(x):
@@ -386,7 +388,7 @@ def _strip_marker_text(doc):
                         for r in p.runs: r.text = ""
                         p.add_run(new)
 
-# ---------------- ROUTE: generate ----------------
+# ---------------- ROUTE: generate (unchanged logic) ----------------
 @app.route("/generate", methods=["POST"])
 def generate():
     storage_types = request.form.getlist("storage_type") or [request.form.get("storage_type", "")]
@@ -433,7 +435,7 @@ def generate():
             continue
         items.append(compute_item(raw_st, vol, d, inc, com))
 
-    # WMS aggregation for combos
+    # WMS aggregation for combos (same as your latest)
     if len(items) > 1:
         has_rms  = any(it.get("category_rms") for it in items)
         has_std  = any(it.get("category_standard") for it in items)
@@ -742,15 +744,15 @@ def _build_or_load_index_rag():
     return vecs, meta
 
 def _ensure_index():
-    """Force rebuild of RAG index every startup (ensures new/changed files are used)."""
+    """Load/build RAG index once per process (fast runtime)."""
     global RAG_VECTORS, RAG_META
-    try: os.remove(RAG_INDEX_PATH)
-    except FileNotFoundError: pass
-    try: os.remove(RAG_META_PATH)
-    except FileNotFoundError: pass
-    RAG_VECTORS, RAG_META = _build_or_load_index_rag()
-    log.info("RAG index rebuilt with %d chunks from %d paths",
-             RAG_VECTORS.shape[0], len({m['path'] for m in RAG_META}))
+    if RAG_VECTORS.shape[0] == 0 or not RAG_META:
+        RAG_VECTORS, RAG_META = _build_or_load_index_rag()
+        log.info("RAG index ready: %d chunks from %d paths",
+                 RAG_VECTORS.shape[0], len({m['path'] for m in RAG_META}))
+
+# ==== Build index at process start (NOT per request) ====
+_ensure_index()
 
 # ================== Hybrid retrieval & chat ==================
 def _tokenize(s: str):
@@ -766,7 +768,6 @@ def _has_strong_ctx(ctx, question: str) -> bool:
     return hit >= 2
 
 def _retrieve_ctx(query_str: str, top_k=TOP_K):
-    """Hybrid retriever: semantic similarity + keyword boost (prefers templates/chatbot)."""
     if RAG_VECTORS.shape[0]==0 or not RAG_META:
         return []
     client=OpenAI()
@@ -808,19 +809,20 @@ def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str
             blocks.append(r["text"])
     context="\n\n---\n\n".join(blocks) if blocks else "No project context found."
 
-    system=("You are DSV’s project assistant. Use conversation history to resolve pronouns and follow-ups "
-            "(continue same subject unless the user changes it). Answer **from the project context**. "
-            "If the context doesn’t contain the answer, say so briefly.")
+    system=("You are DSV’s project assistant. Use conversation history to resolve follow-ups. "
+            "Answer from the project context. If the context doesn’t contain the answer, say so briefly.")
     msgs = [{"role":"system","content":system}]
     for m in history_msgs[-MAX_TURNS:]:
         msgs.append({"role": m["role"], "content": m["content"]})
     msgs.append({"role":"system","content": f"Project context:\n{context}"} )
     msgs.append({"role":"user","content": question})
 
+    # keep replies short for speed
     resp=client.chat.completions.create(
         model=AI_MODEL,
         messages=msgs,
         temperature=0.2,
+        max_tokens=300
     )
     ans = resp.choices[0].message.content.strip()
     if TAG_SOURCES:
@@ -838,7 +840,12 @@ def _llm_general_answer(question: str, history_msgs: list) -> str:
     for m in history_msgs[-MAX_TURNS:]:
         msgs.append({"role": m["role"], "content": m["content"]})
     msgs.append({"role":"user","content":question})
-    resp=client.chat.completions.create(model=AI_MODEL, messages=msgs, temperature=0.2)
+    resp=client.chat.completions.create(
+        model=AI_MODEL,
+        messages=msgs,
+        temperature=0.2,
+        max_tokens=250   # shorter => faster
+    )
     ans = resp.choices[0].message.content.strip()
     if TAG_SOURCES:
         ans = "[General knowledge] " + ans
@@ -856,22 +863,17 @@ def _is_nonanswer(text: str) -> bool:
 
 def _smart_answer(question: str, history_msgs: list) -> str:
     if not os.getenv("OPENAI_API_KEY"):
-        return ("AI answers are disabled because OPENAI_API_KEY is not set. "
-                "Add it in your Render environment to enable the smart chatbot.")
-    _ensure_index()
-
-    # Retrieval uses recent topic anchor to maintain subject continuity
+        return ("AI answers are disabled because OPENAI_API_KEY is not set.")
+    # retrieval uses recent topic
     anchor = _history_text_for_query(history_msgs)
     query_for_retrieval = question if not anchor else f"{question}\n\nRecent topic: {anchor}"
     ctx=_retrieve_ctx(query_for_retrieval)
 
-    # If context looks weak and STRICT_LOCAL is OFF, use plain ChatGPT
     if not _has_strong_ctx(ctx, question):
         if STRICT_LOCAL:
             return "I don’t have this in your saved files."
         return _llm_general_answer(question, history_msgs)
 
-    # Answer with files + history
     ans = _answer_with_ctx(question, ctx, history_msgs)
     if _is_nonanswer(ans):
         if STRICT_LOCAL:
@@ -883,7 +885,7 @@ def _smart_answer(question: str, history_msgs: list) -> str:
 @app.route("/smart_chat", methods=["POST"])
 def smart_chat():
     data = request.get_json(silent=True) or {}
-    message = (data.get("message") or "").trim()
+    message = (data.get("message") or "").strip()
     cid = _get_cid()
     if not message:
         resp = make_response(jsonify({"reply": "Hi! Ask me anything about this project—files, templates, rates, or how the app works."}))
@@ -902,7 +904,6 @@ def smart_chat():
         resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
         return resp
 
-# Backward-compatible /chat
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
@@ -925,9 +926,18 @@ def chat():
         resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
         return resp
 
-# Optional manual reindex hook
+# manual reindex (when you add files)
 @app.route("/reindex", methods=["POST"])
 def reindex():
+    # blow away cache and rebuild once
+    try: os.remove(RAG_INDEX_PATH)
+    except FileNotFoundError: pass
+    try: os.remove(RAG_META_PATH)
+    except FileNotFoundError: pass
+    # reset globals and rebuild
+    global RAG_VECTORS, RAG_META
+    RAG_VECTORS = np.zeros((0,1536),dtype=np.float32)
+    RAG_META = []
     _ensure_index()
     return jsonify({
         "ok": True,
