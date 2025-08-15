@@ -1,30 +1,30 @@
-from flask import Flask, render_template, request, send_file
+from flask import Flask, render_template, request, send_file, jsonify
 from docx import Document
-import os
-import math
+from docx.shared import Pt
+from docx.enum.text import WD_LINE_SPACING
+import os, re
 from datetime import datetime
-import pandas as pd  # Excel matrix
+import pandas as pd
+from copy import deepcopy
 
 app = Flask(__name__)
 
-# ===== Excel-driven matrix for Standard tiers =====
+# ---------- Excel matrix ----------
 TARIFF_PATH = "CL TARIFF - 2025 v3 (004) - UPDATED 6TH AUGUST 2025.xlsx"
 
 def _is_num(x):
     return isinstance(x, (int, float)) and pd.notna(x)
 
 def _daily_rate_from_row(df, r, from_col=2, to_col=3):
-    """Pick a plausible AED/CBM/DAY cell from the row (skip From/To)."""
     candidates, fallback = [], []
     for c in range(df.shape[1]):
-        if c in (from_col, to_col):
+        if c in (from_col, to_col):  # skip the From/To columns
             continue
         v = df.iat[r, c]
         if _is_num(v):
             v = float(v)
-            # filter out handling/minimum values
             if 1.2 <= v <= 10.0:
-                candidates.append(v)
+                candidates.append(v)   # likely CBM/day
             elif v > 0:
                 fallback.append(v)
     if candidates:
@@ -38,230 +38,439 @@ def _bands_from_rows(df, rows, from_col=2, to_col=3):
         t = df.iat[r, to_col]
         if isinstance(t, str) and "above" in t.lower():
             t = float("inf")
-        rate = _daily_rate_from_row(df, r, from_col, to_col)
-        out.append((float(f), float(t), float(rate)))
+        out.append((float(f), float(t), float(_daily_rate_from_row(df, r, from_col, to_col))))
     return out
 
 def load_matrix():
     xls = pd.ExcelFile(TARIFF_PATH)
     wh = pd.read_excel(xls, "CL - WH & OY (2)", header=None)
-
     ac_lt1m_rows  = [5, 6, 7]
     ac_ge1m_rows  = [12, 13, 14]
     dry_lt1m_rows = [22, 23, 24]
     dry_ge1m_rows = [29, 30, 31]
-
     return {
-        "ac": {
-            "lt1m": _bands_from_rows(wh, ac_lt1m_rows),
-            "ge1m": _bands_from_rows(wh, ac_ge1m_rows)
-        },
-        "dry": {
-            "lt1m": _bands_from_rows(wh, dry_lt1m_rows),
-            "ge1m": _bands_from_rows(wh, dry_ge1m_rows)
-        },
+        "ac":  {"lt1m": _bands_from_rows(wh, ac_lt1m_rows),  "ge1m": _bands_from_rows(wh, ac_ge1m_rows)},
+        "dry": {"lt1m": _bands_from_rows(wh, dry_lt1m_rows), "ge1m": _bands_from_rows(wh, dry_ge1m_rows)},
     }
 
 MATRIX = load_matrix()
 
-def pick_tier_rate(bands, volume):
+def _pick_rate(bands, volume):
     for f, t, r in bands:
         if f <= volume <= t:
             return r
     return bands[-1][2] if bands else 0.0
-# ==================================================
 
 @app.route("/")
 def index():
     return render_template("form.html")
 
-@app.route("/generate", methods=["POST"])
-def generate():
-    storage_type = request.form.get("storage_type", "")
-    volume = float(request.form.get("volume", 0))
-    days = int(request.form.get("days", 0))
-    include_wms = request.form.get("wms", "No") == "Yes"
-    commodity = request.form.get("commodity", "").strip()
-    today_str = datetime.today().strftime("%d %b %Y")
-
-    # Pick template based on storage_type
-    if "chemical" in storage_type.lower():
-        template_path = "templates/Chemical VAS.docx"
-    elif "open yard" in storage_type.lower():
-        template_path = "templates/Open Yard VAS.docx"
-    else:
-        template_path = "templates/Standard VAS.docx"
-
-    doc = Document(template_path)
-
-    # ===== Rates / units (matrix for Standard; Chemical split; Open Yard monthly options) =====
-    unit, rate_unit = "CBM", "CBM / DAY"
-    rate = 0.0
-    storage_fee = 0.0
+# ---- pricing for one item ----
+def compute_item(storage_type, volume, days, include_wms, commodity=""):
+    st = (storage_type or "").strip()
+    st_lower = st.lower()
     period_lt_1m = days < 30
 
-    if storage_type == "AC":
-        bands = MATRIX["ac"]["lt1m"] if period_lt_1m else MATRIX["ac"]["ge1m"]
-        rate = pick_tier_rate(bands, volume)
+    rate = 0.0
+    unit, rate_unit = "CBM", "CBM / DAY"
+    storage_fee = 0.0
+
+    if st in ("AC", "Non-AC", "Open Shed"):
+        family = "ac" if st == "AC" else "dry"
+        bands = MATRIX[family]["lt1m"] if period_lt_1m else MATRIX[family]["ge1m"]
+        rate = _pick_rate(bands, volume)
         storage_fee = volume * days * rate
-
-    elif storage_type == "Non-AC" or storage_type == "Open Shed":
-        bands = MATRIX["dry"]["lt1m"] if period_lt_1m else MATRIX["dry"]["ge1m"]
-        rate = pick_tier_rate(bands, volume)
-        storage_fee = volume * days * rate
-
-    elif storage_type == "Chemicals AC":
-        rate = 3.5
-        storage_fee = volume * days * rate
-
-    elif storage_type == "Chemicals Non-AC (Non-DG)":
-        rate = 2.5
-        storage_fee = volume * days * rate
-
-    elif storage_type == "Chemicals Non-AC (DG)":
-        rate = 3.0
-        storage_fee = volume * days * rate
-
-    elif storage_type == "Chemicals Non-AC":  # backward compatibility
-        rate = 2.5
-        storage_fee = volume * days * rate
-
-    elif "open yard – kizad" in storage_type.lower():
-        rate, unit, rate_unit = 125, "SQM", "SQM / YEAR"
-        storage_fee = volume * days * (rate / 365)
-
-    elif storage_type == "Open Yard – Mussafah (Open Yard)":
+    elif st == "Chemicals AC":
+        rate = 3.5; storage_fee = volume * days * rate
+    elif st == "Chemicals Non-AC (Non-DG)":
+        rate = 2.5; storage_fee = volume * days * rate
+    elif st == "Chemicals Non-AC (DG)":
+        rate = 3.0; storage_fee = volume * days * rate
+    elif st == "Chemicals Non-AC":
+        rate = 2.5; storage_fee = volume * days * rate
+    elif "open yard – kizad" in st_lower:
+        rate, unit, rate_unit = 125.0, "SQM", "SQM / YEAR"
+        storage_fee = volume * days * (rate / 365.0)
+    elif st == "Open Yard – Mussafah (Open Yard)":
         unit, rate_unit, rate = "SQM", "SQM / MONTH", 15.0
         storage_fee = volume * days * (rate / 30.0)
-
-    elif storage_type == "Open Yard – Mussafah (Open Yard Shed)":
+    elif st == "Open Yard – Mussafah (Open Yard Shed)":
         unit, rate_unit, rate = "SQM", "SQM / MONTH", 35.0
         storage_fee = volume * days * (rate / 30.0)
-
-    elif storage_type == "Open Yard – Mussafah (Jumbo Bag)":
+    elif st == "Open Yard – Mussafah (Jumbo Bag)":
         unit, rate_unit, rate = "BAG", "BAG / MONTH", 19.0
         storage_fee = volume * days * (rate / 30.0)
 
-    else:
-        rate, unit, rate_unit, storage_fee = 0, "CBM", "CBM / DAY", 0
-
-    storage_fee = round(storage_fee, 2)
-
-    # ===== WMS (625/month for Chemicals, 1500/month otherwise; excluded for Open Yard) =====
-    months = max(1, days // 30)  # minimum 1 month if included
-    st_lower = storage_type.lower()
     is_open_yard = "open yard" in st_lower
     is_chemical = "chemical" in st_lower
+    months = max(1, days // 30)
     wms_monthly = 625 if is_chemical else 1500
     wms_fee = 0 if is_open_yard or not include_wms else wms_monthly * months
 
-    total_fee = round(storage_fee + wms_fee, 2)
-
-    placeholders = {
-        "{{STORAGE_TYPE}}": storage_type,
-        "{{DAYS}}": str(days),
-        "{{VOLUME}}": str(volume),
-        "{{UNIT}}": unit,
-        "{{WMS_STATUS}}": "" if is_open_yard else ("INCLUDED" if include_wms else "NOT INCLUDED"),
-        "{{UNIT_RATE}}": f"{rate:.2f} AED / {rate_unit}",
-        "{{STORAGE_FEE}}": f"{storage_fee:,.2f} AED",
-        "{{WMS_FEE}}": f"{wms_fee:,.2f} AED",
-        "{{TOTAL_FEE}}": f"{total_fee:,.2f} AED",
-        "{{TODAY_DATE}}": today_str,
-        "{{COMMODITY}}": commodity or "N/A",
+    return {
+        "storage_type": st, "unit": unit, "rate": float(rate), "rate_unit": rate_unit,
+        "volume": float(volume), "days": int(days), "storage_fee": round(storage_fee, 2),
+        "include_wms": bool(include_wms and not is_open_yard), "wms_monthly": wms_monthly,
+        "months": months, "wms_fee": int(0 if is_open_yard or not include_wms else wms_monthly * months),
+        "category_standard": st in ("AC", "Non-AC", "Open Shed"),
+        "category_chemical": is_chemical, "category_openyard": is_open_yard,
+        "commodity": (commodity or "").strip(),
     }
 
-    # If Chemical template shows a static "1,500.00 AED / MONTH", replace it with 625.00
-    if is_chemical:
-        placeholders["1,500.00 AED / MONTH"] = "625.00 AED / MONTH"
+# --------- commodity helpers ----------
+def _clean_commodity(val: str) -> str:
+    s = (val or "").strip()
+    if not s: return ""
+    if re.fullmatch(r"\d+(\.\d+)?", s):  # numeric-only noise
+        return ""
+    return s
 
-    # ===== Replace placeholders even if Word split them across runs =====
-    def replace_in_paragraph(paragraph, mapping):
-        if not paragraph.runs:
-            return
-        full_text = "".join(run.text for run in paragraph.runs)
-        new_text = full_text
-        for key, val in mapping.items():
-            new_text = new_text.replace(key, val)
-        if new_text != full_text:
-            for run in paragraph.runs:
-                run.text = ""
-            paragraph.runs[0].text = new_text
+# ---------- DOCX helpers ----------
+def find_quote_table(doc):
+    for t in doc.tables:
+        try:
+            head = " ".join(c.text.strip().lower() for c in t.rows[0].cells)
+        except Exception:
+            continue
+        if "item" in head and "unit rate" in head and "amount" in head:
+            return t
+    return None
 
-    def replace_placeholders(doc_obj, mapping):
-        for p in doc_obj.paragraphs:
-            replace_in_paragraph(p, mapping)
-        for table in doc_obj.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for p in cell.paragraphs:
-                        replace_in_paragraph(p, mapping)
+def _delete_row(table, row_idx):
+    row = table.rows[row_idx]
+    row._element.getparent().remove(row._element)
 
-    replace_placeholders(doc, placeholders)
+def _clear_quote_table_keep_header(table):
+    while len(table.rows) > 1:
+        _delete_row(table, 1)
 
-    # ===== Delete blocks bracketed by [TAG] ... [/TAG] =====
-    def _delete_block_in_paragraphs(doc_obj, start_tag, end_tag):
-        inside = False
-        to_delete = []
-        for i, p in enumerate(doc_obj.paragraphs):
-            if start_tag in p.text:
-                inside = True
-                to_delete.append(i)
-            elif end_tag in p.text:
-                to_delete.append(i)
-                inside = False
-            elif inside:
-                to_delete.append(i)
-        for i in reversed(to_delete):
-            elem = doc_obj.paragraphs[i]._element
-            parent = elem.getparent()
-            if parent is not None:
-                parent.remove(elem)
+def _body_children(doc):
+    return list(doc._element.body.iterchildren())
 
-    def _delete_block_in_tables(doc_obj, start_tag, end_tag):
-        for table in doc_obj.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    inside = False
-                    to_remove = []
-                    for p in cell.paragraphs:
-                        if start_tag in p.text:
-                            inside = True
-                            to_remove.append(p)
-                        elif end_tag in p.text:
-                            to_remove.append(p)
-                            inside = False
-                        elif inside:
-                            to_remove.append(p)
-                    for p in to_remove:
-                        elem = p._element
-                        parent = elem.getparent()
-                        if parent is not None:
-                            parent.remove(elem)
+def _el_text(el) -> str:
+    return "".join(el.itertext())
 
-    def delete_block(doc_obj, start_tag, end_tag):
-        _delete_block_in_paragraphs(doc_obj, start_tag, end_tag)
-        _delete_block_in_tables(doc_obj, start_tag, end_tag)
+def _copy_blocks_between_markers(src_doc, start_tag, end_tag):
+    body = _body_children(src_doc)
+    start_i = end_i = None
+    for i, el in enumerate(body):
+        if el.tag.endswith('p') and start_tag in _el_text(el):
+            start_i = i
+        if start_i is not None and el.tag.endswith('p') and end_tag in _el_text(el):
+            end_i = i; break
+    if start_i is None or end_i is None or end_i <= start_i + 1:
+        return []
+    return [deepcopy(el) for el in body[start_i + 1:end_i]]
 
-    # Keep only the relevant VAS section
-    if "open yard" in st_lower:
-        delete_block(doc, "[VAS_STANDARD]", "[/VAS_STANDARD]")
-        delete_block(doc, "[VAS_CHEMICAL]", "[/VAS_CHEMICAL]")
-    elif "chemical" in st_lower:
-        delete_block(doc, "[VAS_STANDARD]", "[/VAS_STANDARD]")
-        delete_block(doc, "[VAS_OPENYARD]", "[/VAS_OPENYARD]")
+def _append_blocks(dest_doc, blocks):
+    body = dest_doc._element.body
+    for el in blocks:
+        body.append(el)
+
+def _is_vas_table(tbl):
+    if not tbl.rows: return False
+    hdr = " | ".join(c.text.strip().lower() for c in tbl.rows[0].cells)
+    return ("vas" in hdr and "price" in hdr) or ("main activity" in hdr and "transaction" in hdr)
+
+def _purge_all_vas_tables_and_headings(doc):
+    # remove headings
+    for p in list(doc.paragraphs):
+        if (p.text or "").strip() in ("Standard VAS", "Chemical VAS", "Open Yard VAS",
+                                      "Terms & Conditions — Chemical", "Terms & Conditions — Open Yard"):
+            el = p._element; pa = el.getparent()
+            if pa is not None: pa.remove(el)
+    # remove vas-like tables
+    for tbl in list(doc.tables):
+        if _is_vas_table(tbl):
+            el = tbl._element; pa = el.getparent()
+            if pa is not None: pa.remove(el)
+
+def _append_vas_heading_and_blocks(blocks, heading_text):
+    # Return a list of elements [blank, heading_p, ...blocks...]
+    out = []
+    p = Document().add_paragraph()._element  # harmless blank paras are tricky; will use one blank paragraph later
+    # create heading paragraph
+    tmp = Document()
+    hp = tmp.add_paragraph(heading_text)
+    hp.runs[0].bold = True
+    out.append(deepcopy(hp._element))
+    out.extend(blocks)
+    return out
+
+def _vas_blocks_from_template(path, start_tag, end_tag, heading):
+    src = Document(path)
+    blocks = _copy_blocks_between_markers(src, start_tag, end_tag)
+    if blocks:
+        return _append_vas_heading_and_blocks(blocks, heading)
+    # fallback: take first VAS-like table if tags are missing
+    for tbl in src.tables:
+        if _is_vas_table(tbl):
+            tmp = Document(); h = tmp.add_paragraph(heading); h.runs[0].bold = True
+            return [deepcopy(h._element), deepcopy(tbl._element)]
+    return []
+
+def _find_para_el_contains(doc, needle):
+    for p in doc.paragraphs:
+        if needle.lower() in (p.text or "").lower():
+            return p._element
+    return None
+
+def _insert_blocks_after(doc, ref_el, blocks):
+    body = doc._element.body
+    idx = body.index(ref_el)
+    for i, el in enumerate(blocks):
+        body.insert(idx + 1 + i, el)
+
+def _append_terms_from_template(path, terms_heading="Storage Terms and Conditions:",
+                                end_markers=("Validity:", "We trust that")):
+    src = Document(path)
+    body = _body_children(src)
+    start_i = None
+    for i, el in enumerate(body):
+        if el.tag.endswith("p") and terms_heading.lower() in _el_text(el).lower():
+            start_i = i; break
+    if start_i is None: return []
+    end_i = len(body)
+    for j in range(start_i + 1, len(body)):
+        if body[j].tag.endswith("p"):
+            txt = _el_text(body[j]).strip()
+            if any(m.lower() in txt.lower() for m in end_markers):
+                end_i = j; break
+    return [deepcopy(el) for el in body[start_i + 1:end_i]]
+
+def _set_table_line_spacing(table, rule=WD_LINE_SPACING.ONE_POINT_FIVE):
+    for row in table.rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                p.paragraph_format.line_spacing_rule = rule
+
+def _rebuild_quotation_table(doc, items, grand_total):
+    qt = find_quote_table(doc)
+    if not qt:
+        doc.add_paragraph()
+        qt = doc.add_table(rows=1, cols=3)
+        hdr = qt.rows[0].cells
+        hdr[0].text, hdr[1].text, hdr[2].text = "Item", "Unit Rate", "Amount (AED)"
+    _clear_quote_table_keep_header(qt)
+
+    for it in items:
+        r = qt.add_row().cells
+        r[0].text = it['storage_type']
+        r[1].text = f"{it['rate']:.2f} AED / {it['rate_unit']}"
+        r[2].text = f"{it['storage_fee']:,.2f} AED"
+        if it["include_wms"]:
+            r = qt.add_row().cells
+            r[0].text = f"WMS — {it['storage_type']} ({it['months']} month{'s' if it['months']!=1 else ''})"
+            r[1].text = f"{it['wms_monthly']:.2f} AED / MONTH"
+            r[2].text = f"{it['wms_fee']:,.2f} AED"
+
+    total_row = qt.add_row().cells
+    total_row[0].text = "Total Fee"
+    total_row[1].text = ""
+    total_row[2].text = f"{grand_total:,.2f} AED"
+    for p in total_row[0].paragraphs:
+        for run in p.runs:
+            run.bold = True; run.font.size = Pt(11)
+    for p in total_row[2].paragraphs:
+        for run in p.runs:
+            run.bold = True; run.font.size = Pt(11)
+    _set_table_line_spacing(qt, WD_LINE_SPACING.ONE_POINT_FIVE)
+
+def _delete_summary_lines_for_multi(doc):
+    targets = ("Storage Period:", "Storage Size:",
+               "We trust that the rates", "Yours Faithfully", "DSV Solutions PJSC", "Validity:")
+    to_remove = []
+    for p in doc.paragraphs:
+        t = (p.text or "").strip()
+        if any(t.lower().startswith(x.lower()) for x in targets):
+            to_remove.append(p)
+    for p in to_remove:
+        el = p._element; pa = el.getparent()
+        if pa is not None: pa.remove(el)
+
+# ---------- ROUTE: generate ----------
+@app.route("/generate", methods=["POST"])
+def generate():
+    storage_types = request.form.getlist("storage_type") or [request.form.get("storage_type", "")]
+    volumes       = request.form.getlist("volume")       or [request.form.get("volume", 0)]
+    days_list     = request.form.getlist("days")         or [request.form.get("days", 0)]
+    wms_list      = request.form.getlist("wms")          or [request.form.get("wms", "No")]
+    commodities_raw = request.form.getlist("commodity") or [request.form.get("commodity", "")]
+    canonical_commodity = next((c for c in ( _clean_commodity(v) for v in commodities_raw ) if c), "")
+
+    n = max(len(storage_types), len(volumes), len(days_list), len(wms_list))
+    storage_types += [""] * (n - len(storage_types))
+    volumes       += [0]  * (n - len(volumes))
+    days_list     += [0]  * (n - len(days_list))
+    wms_list      += ["No"] * (n - len(wms_list))
+
+    items = []
+    for i in range(n):
+        st  = storage_types[i]
+        vol = float(volumes[i] or 0)
+        d   = int(days_list[i] or 0)
+        inc = (wms_list[i] == "Yes")
+        com = _clean_commodity(commodities_raw[i] if i < len(commodities_raw) else "") or canonical_commodity
+        if not st: continue
+        items.append(compute_item(st, vol, d, inc, com))
+    if not items:
+        items = [compute_item("AC", 0.0, 0, False)]
+
+    today_str = datetime.today().strftime("%d %b %Y")
+
+    if len(items) == 1:
+        st0 = items[0]["storage_type"].lower()
+        if "chemical" in st0: template_path = "templates/Chemical VAS.docx"
+        elif "open yard" in st0: template_path = "templates/Open Yard VAS.docx"
+        else: template_path = "templates/Standard VAS.docx"
     else:
-        delete_block(doc, "[VAS_CHEMICAL]", "[/VAS_CHEMICAL]")
-        delete_block(doc, "[VAS_OPENYARD]", "[/VAS_OPENYARD]")
+        template_path = "templates/Standard VAS.docx"
+    doc = Document(template_path)
 
-    # ===== Save & return =====
+    total_storage = round(sum(i["storage_fee"] for i in items), 2)
+    total_wms     = round(sum(i["wms_fee"]    for i in items), 2)
+    grand_total   = round(total_storage + total_wms, 2)
+
+    if len(items) == 1:
+        one = items[0]
+        unit_for_display = one["unit"]
+        unit_rate_text   = f"{one['rate']:.2f} AED / {one['rate_unit']}"
+        wms_status = "" if one["category_openyard"] else ("INCLUDED" if one["include_wms"] else "NOT INCLUDED")
+        storage_type_text = one["storage_type"]; days_text = str(one["days"]); volume_text = str(one["volume"])
+        commodity_text = one.get("commodity") or canonical_commodity or "N/A"
+    else:
+        st_lines = []
+        for it in items:
+            qty = f"{it['volume']} {it['unit']}".strip()
+            dur = f"{it['days']} day{'s' if it['days'] != 1 else ''}"
+            st_lines.append(f"{it['storage_type']} ({qty} × {dur})")
+        storage_type_text = "\n".join(st_lines)
+
+        cm_lines = []
+        for it in items:
+            cm = it.get("commodity") or canonical_commodity or "N/A"
+            cm_lines.append(f"{it['storage_type']} — {cm}")
+        commodity_text = "\n".join(cm_lines)
+
+        unit_for_display = ""; unit_rate_text = "—"
+        days_text = "VARIOUS"; volume_text = "VARIOUS"
+        wms_status = "SEE BREAKDOWN"
+
+    placeholders = {
+        "{{STORAGE_TYPE}}": storage_type_text, "{{DAYS}}": days_text, "{{VOLUME}}": volume_text,
+        "{{UNIT}}": unit_for_display, "{{WMS_STATUS}}": wms_status, "{{UNIT_RATE}}": unit_rate_text,
+        "{{STORAGE_FEE}}": f"{total_storage:,.2f} AED", "{{WMS_FEE}}": f"{total_wms:,.2f} AED",
+        "{{TOTAL_FEE}}": f"{grand_total:,.2f} AED", "{{TODAY_DATE}}": today_str,
+        "{{COMMODITY}}": commodity_text,
+        "1,500.00 AED / MONTH": "625.00 AED / MONTH" if any(i["category_chemical"] for i in items) else "1,500.00 AED / MONTH",
+    }
+
+    def replace_in_paragraph(paragraph, mapping):
+        if not paragraph.runs: return
+        full = "".join(r.text for r in paragraph.runs); new = full
+        for k, v in mapping.items(): new = new.replace(k, v)
+        if new != full:
+            for r in paragraph.runs: r.text = ""
+            paragraph.runs[0].text = new
+
+    def replace_all(doc_obj, mapping):
+        for p in doc_obj.paragraphs: replace_in_paragraph(p, mapping)
+        for table in doc_obj.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs: replace_in_paragraph(p, mapping)
+
+    replace_all(doc, placeholders)
+
+    # Remove bullets/closing for multi (we'll append custom at the end)
+    if len(items) > 1: _delete_summary_lines_for_multi(doc)
+
+    used_standard = any(i["category_standard"] for i in items)
+    used_chemical = any(i["category_chemical"] for i in items)
+    used_openyard = any(i["category_openyard"] for i in items)
+
+    # ---------- VAS ORDER & PLACEMENT ----------
+    if len(items) > 1:
+        # 1) Purge any VAS-like tables/headings present in base
+        _purge_all_vas_tables_and_headings(doc)
+
+        # 2) Determine families in the EXACT order the user selected
+        fam_order = []
+        for it in items:
+            fam = "standard" if it["category_standard"] else ("chemical" if it["category_chemical"] else ("openyard" if it["category_openyard"] else None))
+            if fam and fam not in fam_order: fam_order.append(fam)
+
+        # 3) Build blocks for each family (heading + table) in that order
+        family_blocks = []
+        for fam in fam_order:
+            if fam == "standard" and used_standard:
+                family_blocks += _vas_blocks_from_template("templates/Standard VAS.docx", "[VAS_STANDARD]", "[/VAS_STANDARD]", "Standard VAS")
+            elif fam == "chemical" and used_chemical:
+                family_blocks += _vas_blocks_from_template("templates/Chemical VAS.docx", "[VAS_CHEMICAL]", "[/VAS_CHEMICAL]", "Chemical VAS")
+            elif fam == "openyard" and used_openyard:
+                family_blocks += _vas_blocks_from_template("templates/Open Yard VAS.docx", "[VAS_OPENYARD]", "[/VAS_OPENYARD]", "Open Yard VAS")
+
+        # 4) Insert VAS sequence RIGHT AFTER the "Note: Minimum Monthly storage charges" paragraph
+        anchor = _find_para_el_contains(doc, "Minimum Monthly storage charges")
+        if anchor is None:  # fallback: after "Storage Additional Fees"
+            anchor = _find_para_el_contains(doc, "Storage Additional Fees")
+        if anchor is None:  # if not found, append at end
+            _append_blocks(doc, family_blocks)
+        else:
+            _insert_blocks_after(doc, anchor, family_blocks)
+
+        # ---------- Combined Terms & Conditions at the end ----------
+        combined = []
+        if used_standard:
+            combined += _append_terms_from_template("templates/Standard VAS.docx")
+        if used_chemical:
+            combined += _append_terms_from_template("templates/Chemical VAS.docx")
+        if used_openyard:
+            combined += _append_terms_from_template("templates/Open Yard VAS.docx")
+
+        # De-duplicate; and handle the non-Haz line according to selection
+        doc.add_paragraph(" ")
+        h = doc.add_paragraph("Terms & Conditions — Combined"); h.runs[0].bold = True
+        seen = set()
+        non_haz_line = "The above rates offered are for non-Haz cargo."
+        keep_non_haz = not any(it["storage_type"] == "Chemicals AC" for it in items)
+
+        for el in combined:
+            text = _el_text(el).strip()
+            norm = re.sub(r"\s+", " ", text).strip().lower()
+            if not norm: continue
+            if not keep_non_haz and non_haz_line.lower() in norm:
+                continue  # drop this line
+            if norm in seen: continue
+            seen.add(norm)
+            doc._element.body.append(deepcopy(el))
+
+        # if we should keep it and it wasn't present, add it once
+        if keep_non_haz and all(non_haz_line.lower() not in re.sub(r"\s+", " ", _el_text(el)).lower() for el in combined):
+            doc.add_paragraph(non_haz_line)
+
+        # Closing block at the very end
+        doc.add_paragraph(" ")
+        doc.add_paragraph("Validity: 15 Days")
+        doc.add_paragraph("")
+        doc.add_paragraph("We trust that the rates and services provided are to your satisfaction and should you require any further details please do not hesitate to contact me.")
+        doc.add_paragraph("Yours Faithfully,")
+        doc.add_paragraph("")
+        doc.add_paragraph("DSV Solutions PJSC")
+
+    # Rebuild Quotation Details table (also sets 1.5 line spacing)
+    _rebuild_quotation_table(doc, items, grand_total)
+
+    # Save
     os.makedirs("generated", exist_ok=True)
-    filename_prefix = commodity if commodity else "quotation"
-    filename = f"Quotation_{filename_prefix}.docx"
+    filename = f"Quotation_{(request.form.get('commodity') or 'quotation').strip() or 'quotation'}.docx"
     output_path = os.path.join("generated", filename)
     doc.save(output_path)
-
     return send_file(output_path, as_attachment=True)
+
+
+
+
 
 
 
