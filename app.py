@@ -1,9 +1,8 @@
-# app.py
-from flask import Flask, render_template, request, send_file, jsonify
+from flask import Flask, render_template, request, send_file, jsonify, make_response
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_LINE_SPACING
-import os, re, logging, json, hashlib, fnmatch
+import os, re, logging, json, hashlib, fnmatch, uuid
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -21,7 +20,7 @@ EMB_MODEL = os.getenv("AI_EMB_MODEL", "text-embedding-3-small")
 RAG_INDEX_PATH = Path("rag_index.npz")
 RAG_META_PATH  = Path("rag_index_meta.json")
 
-RAG_FOLDERS = ["templates", "templates/chatbot", "static"]  # explicit chatbot
+RAG_FOLDERS = ["templates", "templates/chatbot", "static"]  # explicit chatbot folder
 RAG_GLOBS = ["*.py","*.js","*.ts","*.html","*.css","*.txt","*.md","*.docx","*.xlsx","*.pdf"]
 EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", "generated"}
 
@@ -34,14 +33,46 @@ MAX_TOTAL_CHUNKS  = 4000
 EMBED_BATCH       = 32
 AI_DEBUG          = os.getenv("AI_DEBUG", "0") == "1"
 
+# Optional behavior toggles
+TAG_SOURCES       = os.getenv("TAG_SOURCES", "0") == "1"   # label replies with source class
+STRICT_LOCAL      = os.getenv("STRICT_LOCAL", "0") == "1"  # refuse if not in files
+
 # pre-init to avoid NameError
 RAG_VECTORS = np.zeros((0, 1536), dtype=np.float32)
 RAG_META = []
 
+# ---- conversational memory (per user via cookie) ----
+CONV = {}              # { cid: [ {"role":"user"|"assistant", "content": "..."} , ... ] }
+MAX_TURNS = 10         # keep last N messages (user+assistant)
+
+def _get_cid():
+    cid = request.cookies.get("cid")
+    if not cid:
+        cid = uuid.uuid4().hex
+    return cid
+
+def _get_history(cid):
+    return CONV.get(cid, [])
+
+def _append_history(cid, role, content):
+    hist = CONV.get(cid, [])
+    hist.append({"role": role, "content": (content or "").strip()})
+    if len(hist) > MAX_TURNS:
+        hist = hist[-MAX_TURNS:]
+    CONV[cid] = hist
+
+def _history_text_for_query(hist, max_chars=600):
+    if not hist:
+        return ""
+    last_user = [m["content"] for m in hist if m["role"]=="user"][-3:]
+    last_asst = [m["content"] for m in hist if m["role"]=="assistant"][-1:] if any(m["role"]=="assistant" for m in hist) else []
+    blob = " | ".join(last_user + last_asst)
+    return blob[-max_chars:]
+
 # ---------------- Flask ----------------
 app = Flask(__name__)
 
-# ================== Matrix / pricing helpers (unchanged structure) ==================
+# ================== Matrix / pricing helpers ==================
 TARIFF_PATH = "CL TARIFF - 2025 v3 (004) - UPDATED 6TH AUGUST 2025.xlsx"
 
 def _is_num(x):
@@ -55,12 +86,9 @@ def _daily_rate_from_row(df, r, from_col=2, to_col=3):
         v = df.iat[r, c]
         if _is_num(v):
             v = float(v)
-            if 1.2 <= v <= 10.0:
-                candidates.append(v)
-            elif v > 0:
-                fallback.append(v)
-    if candidates:
-        return min(candidates)
+            if 1.2 <= v <= 10.0: candidates.append(v)
+            elif v > 0: fallback.append(v)
+    if candidates: return min(candidates)
     return min(fallback) if fallback else 0.0
 
 def _bands_from_rows(df, rows, from_col=2, to_col=3):
@@ -162,8 +190,7 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
 def _clean_commodity(val: str) -> str:
     s = (val or "").strip()
     if not s: return ""
-    if re.fullmatch(r"\d+(\.\d+)?", s):
-        return ""
+    if re.fullmatch(r"\d+(\.\d+)?", s): return ""
     return s
 
 def find_quote_table(doc):
@@ -194,8 +221,7 @@ def _copy_blocks_between_markers(src_doc, start_tag, end_tag):
     body = _body_children(src_doc)
     start_i = end_i = None
     for i, el in enumerate(body):
-        if el.tag.endswith('p') and start_tag in _el_text(el):
-            start_i = i
+        if el.tag.endswith('p') and start_tag in _el_text(el): start_i = i
         if start_i is not None and el.tag.endswith('p') and end_tag in _el_text(el):
             end_i = i; break
     if start_i is None or end_i is None or end_i <= start_i + 1:
@@ -228,8 +254,7 @@ def _purge_all_vas_tables_and_headings(doc):
 
 def _safe_docx(path: str):
     p = Path(path)
-    if not p.exists():
-        return None
+    if not p.exists(): return None
     try:
         return Document(str(p))
     except Exception:
@@ -237,8 +262,7 @@ def _safe_docx(path: str):
 
 def _vas_blocks_from_template(path, start_tag, end_tag, heading):
     src = _safe_docx(path)
-    if not src:
-        return []
+    if not src: return []
     blocks = _copy_blocks_between_markers(src, start_tag, end_tag)
     if blocks:
         tmp = Document(); hp = tmp.add_paragraph(heading); hp.runs[0].bold = True
@@ -314,8 +338,7 @@ def _append_terms_from_template(path,
                                 terms_heading="Storage Terms and Conditions:",
                                 end_markers=("Validity:", "We trust that")):
     src = _safe_docx(path)
-    if not src:
-        return []
+    if not src: return []
     body = _body_children(src)
     start_i = None
     for i, el in enumerate(body):
@@ -373,6 +396,7 @@ def generate():
     commodities_raw = request.form.getlist("commodity") or [request.form.get("commodity", "")]
     canonical_commodity = next((c for c in (_clean_commodity(v) for v in commodities_raw) if c), "")
 
+    # RMS sub-fields
     rms_tier_list  = request.form.getlist("rms_tier")  or []
     rms_boxes_list = request.form.getlist("rms_boxes") or []
 
@@ -397,8 +421,8 @@ def generate():
             tier = (rms_tier_list[i] or "").strip()
             st_label = ("RMS — Premium FM200 Archiving AC Facility"
                         if "premium" in tier.lower() else "RMS — Normal AC Facility")
-            vol = float(rms_boxes_list[i] or 0)
-            inc = True
+            vol = float(rms_boxes_list[i] or 0)  # boxes
+            inc = True  # WMS always ON for RMS
             items.append(compute_item(st_label, vol, d, inc, com))
             continue
 
@@ -409,6 +433,7 @@ def generate():
             continue
         items.append(compute_item(raw_st, vol, d, inc, com))
 
+    # WMS aggregation for combos
     if len(items) > 1:
         has_rms  = any(it.get("category_rms") for it in items)
         has_std  = any(it.get("category_standard") for it in items)
@@ -457,6 +482,7 @@ def generate():
 
     today_str = datetime.today().strftime("%d %b %Y")
 
+    # Choose template
     if len(items) == 1:
         st0 = items[0]["storage_type"].lower()
         if "chemical" in st0: template_path = "templates/Chemical VAS.docx"
@@ -579,16 +605,12 @@ def generate():
         keep_non_haz = not any(it["storage_type"] == "Chemicals AC" for it in items)
 
         for el in combined:
-            if not el.tag.endswith('p'):
-                continue
+            if not el.tag.endswith('p'): continue
             raw = _el_text(el).strip()
-            if not raw:
-                continue
+            if not raw: continue
             norm = re.sub(r"\s+", " ", raw).strip().lower()
-            if not keep_non_haz and non_haz_line.lower() in norm:
-                continue
-            if norm in seen:
-                continue
+            if not keep_non_haz and non_haz_line.lower() in norm: continue
+            if norm in seen: continue
             seen.add(norm)
             doc._element.body.append(deepcopy(el))
 
@@ -616,18 +638,13 @@ def _list_files_for_rag():
     files = []
     for folder in RAG_FOLDERS:
         base = Path(folder)
-        if not base.exists():
-            continue
+        if not base.exists(): continue
         for p in base.rglob("*"):
-            if not p.is_file():
-                continue
-            if any(part in EXCLUDE_DIRS for part in p.parts):
-                continue
-            if not any(fnmatch.fnmatch(p.name, g) for g in RAG_GLOBS):
-                continue
+            if not p.is_file(): continue
+            if any(part in EXCLUDE_DIRS for part in p.parts): continue
+            if not any(fnmatch.fnmatch(p.name, g) for g in RAG_GLOBS): continue
             try:
-                if p.stat().st_size > MAX_FILE_BYTES:
-                    continue
+                if p.stat().st_size > MAX_FILE_BYTES: continue
             except Exception:
                 pass
             files.append(p)
@@ -646,8 +663,7 @@ def _read_pdf_file(p: Path) -> str:
         for i, page in enumerate(reader.pages[:120]):
             txt = page.extract_text() or ""
             txt = txt.strip()
-            if txt:
-                out.append(txt)
+            if txt: out.append(txt)
         return "\n".join(out)
     except Exception:
         return ""
@@ -726,9 +742,8 @@ def _build_or_load_index_rag():
     return vecs, meta
 
 def _ensure_index():
-    """Force rebuild of RAG index every startup."""
+    """Force rebuild of RAG index every startup (ensures new/changed files are used)."""
     global RAG_VECTORS, RAG_META
-    # always remove old cache
     try: os.remove(RAG_INDEX_PATH)
     except FileNotFoundError: pass
     try: os.remove(RAG_META_PATH)
@@ -741,20 +756,28 @@ def _ensure_index():
 def _tokenize(s: str):
     return re.findall(r"[a-z0-9]+", (s or "").lower())
 
-def _retrieve_ctx(q: str, top_k=TOP_K):
+def _has_strong_ctx(ctx, question: str) -> bool:
+    if not ctx: return False
+    total_len = sum(len(md["text"]) for md in ctx)
+    if total_len < 400: return False
+    q_toks = set(t for t in _tokenize(question) if len(t) > 2)
+    sample = " ".join(md["text"] for md in ctx[:3]).lower()
+    hit = sum(1 for t in q_toks if t in sample)
+    return hit >= 2
+
+def _retrieve_ctx(query_str: str, top_k=TOP_K):
     """Hybrid retriever: semantic similarity + keyword boost (prefers templates/chatbot)."""
     if RAG_VECTORS.shape[0]==0 or not RAG_META:
         return []
     client=OpenAI()
     # semantic
-    qemb=client.embeddings.create(model=EMB_MODEL, input=[q]).data[0].embedding
+    qemb=client.embeddings.create(model=EMB_MODEL, input=[query_str]).data[0].embedding
     qv = np.array(qemb,dtype=np.float32)
     qv /= (np.linalg.norm(qv)+1e-9)
     base = RAG_VECTORS / (np.linalg.norm(RAG_VECTORS,axis=1,keepdims=True)+1e-9)
     sims = base @ qv
-
     # keyword
-    q_toks = set(_tokenize(q))  # <-- FIXED (no space)
+    q_toks = set(_tokenize(query_str))
     kw_scores = np.zeros(len(RAG_META), dtype=np.float32)
     for i, md in enumerate(RAG_META):
         t = md["text"].lower()
@@ -763,7 +786,6 @@ def _retrieve_ctx(q: str, top_k=TOP_K):
         if "templates/chatbot" in (md["path"].replace("\\","/")).lower():
             bonus += 0.05 * hit
         kw_scores[i] = bonus
-
     combined = sims + kw_scores
     idx = combined.argsort()[::-1][:max(top_k, 2*top_k)]
     total = 0; out=[]
@@ -775,61 +797,135 @@ def _retrieve_ctx(q: str, top_k=TOP_K):
             break
     return out[:top_k]
 
-def _smart_answer(question: str) -> str:
+def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str:
+    client=OpenAI()
+    blocks=[]; seen=set(); srcs=[]
+    for r in ctx_blocks:
+        p=r["path"]; srcs.append(p)
+        if p not in seen:
+            seen.add(p); blocks.append(f"Source: {p}\n{r['text']}")
+        else:
+            blocks.append(r["text"])
+    context="\n\n---\n\n".join(blocks) if blocks else "No project context found."
+
+    system=("You are DSV’s project assistant. Use conversation history to resolve pronouns and follow-ups "
+            "(continue same subject unless the user changes it). Answer **from the project context**. "
+            "If the context doesn’t contain the answer, say so briefly.")
+    msgs = [{"role":"system","content":system}]
+    for m in history_msgs[-MAX_TURNS:]:
+        msgs.append({"role": m["role"], "content": m["content"]})
+    msgs.append({"role":"system","content": f"Project context:\n{context}"} )
+    msgs.append({"role":"user","content": question})
+
+    resp=client.chat.completions.create(
+        model=AI_MODEL,
+        messages=msgs,
+        temperature=0.2,
+    )
+    ans = resp.choices[0].message.content.strip()
+    if TAG_SOURCES:
+        ans = "[From files] " + ans
+    if AI_DEBUG and srcs:
+        uniq = list(dict.fromkeys(srcs))[:5]
+        ans += "\n\n[Sources]\n" + "\n".join(uniq)
+    return ans
+
+def _llm_general_answer(question: str, history_msgs: list) -> str:
+    client=OpenAI()
+    system=("You are a helpful logistics assistant. Use the prior conversation to keep topic continuity. "
+            "Answer accurately and concisely. If unsure, say you are unsure.")
+    msgs=[{"role":"system","content":system}]
+    for m in history_msgs[-MAX_TURNS:]:
+        msgs.append({"role": m["role"], "content": m["content"]})
+    msgs.append({"role":"user","content":question})
+    resp=client.chat.completions.create(model=AI_MODEL, messages=msgs, temperature=0.2)
+    ans = resp.choices[0].message.content.strip()
+    if TAG_SOURCES:
+        ans = "[General knowledge] " + ans
+    return ans
+
+def _is_nonanswer(text: str) -> bool:
+    if not text: return True
+    bad = [
+        r"does not provide", r"not present in the context",
+        r"based on the provided context.*cannot", r"no project context found",
+        r"i (?:do|don’t|don't) (?:have|see)", r"not specified in the context"
+    ]
+    t = text.strip().lower()
+    return any(re.search(p, t) for p in bad)
+
+def _smart_answer(question: str, history_msgs: list) -> str:
     if not os.getenv("OPENAI_API_KEY"):
         return ("AI answers are disabled because OPENAI_API_KEY is not set. "
                 "Add it in your Render environment to enable the smart chatbot.")
     _ensure_index()
-    ctx=_retrieve_ctx(question)
-    blocks=[]; seen=set(); srcs=[]
-    for r in ctx:
-        p=r["path"]
-        srcs.append(p)
-        if p not in seen:
-            seen.add(p)
-            blocks.append(f"Source: {p}\n{r['text']}")
-        else:
-            blocks.append(r["text"])
-    context="\n\n---\n\n".join(blocks) if blocks else "No project context found."
-    client=OpenAI()
-    system=("You are DSV’s project assistant. Answer clearly using the project context. "
-            "If the context doesn’t contain the answer, say so briefly.")
-    user=f"Question:\n{question}\n\nProject context:\n{context}"
-    resp=client.chat.completions.create(
-        model=AI_MODEL,
-        messages=[{"role":"system","content":system},{"role":"user","content":user}],
-        temperature=0.2,
-    )
-    answer = resp.choices[0].message.content.strip()
-    if AI_DEBUG and srcs:
-        uniq = list(dict.fromkeys(srcs))[:5]
-        answer += "\n\n[Sources]\n" + "\n".join(uniq)
-    return answer
 
+    # Retrieval uses recent topic anchor to maintain subject continuity
+    anchor = _history_text_for_query(history_msgs)
+    query_for_retrieval = question if not anchor else f"{question}\n\nRecent topic: {anchor}"
+    ctx=_retrieve_ctx(query_for_retrieval)
+
+    # If context looks weak and STRICT_LOCAL is OFF, use plain ChatGPT
+    if not _has_strong_ctx(ctx, question):
+        if STRICT_LOCAL:
+            return "I don’t have this in your saved files."
+        return _llm_general_answer(question, history_msgs)
+
+    # Answer with files + history
+    ans = _answer_with_ctx(question, ctx, history_msgs)
+    if _is_nonanswer(ans):
+        if STRICT_LOCAL:
+            return "I don’t have this in your saved files."
+        return _llm_general_answer(question, history_msgs)
+    return ans
+
+# ---------------- Routes with cookie + memory ----------------
 @app.route("/smart_chat", methods=["POST"])
 def smart_chat():
     data = request.get_json(silent=True) or {}
-    message = (data.get("message") or "").strip()
+    message = (data.get("message") or "").trim()
+    cid = _get_cid()
     if not message:
-        return jsonify({"reply": "Hi! Ask me anything about this project—files, templates, rates, or how the app works."})
+        resp = make_response(jsonify({"reply": "Hi! Ask me anything about this project—files, templates, rates, or how the app works."}))
+        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
+        return resp
     try:
-        return jsonify({"reply": _smart_answer(message)})
+        _append_history(cid, "user", message)
+        reply = _smart_answer(message, _get_history(cid))
+        _append_history(cid, "assistant", reply)
+        resp = make_response(jsonify({"reply": reply}))
+        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
+        return resp
     except Exception as e:
         log.exception("smart_chat error")
-        return jsonify({"reply": f"Sorry, an error occurred ({type(e).__name__})."}), 200
+        resp = make_response(jsonify({"reply": f"Sorry, an error occurred ({type(e).__name__})."}), 200)
+        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
+        return resp
 
+# Backward-compatible /chat
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
     raw = (data.get("message") or "").strip()
+    cid = _get_cid()
     if not raw:
-        return jsonify({"reply": "Hi! How can I help with DSV quotations today?"})
+        resp = make_response(jsonify({"reply": "Hi! How can I help with DSV quotations today?"}))
+        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
+        return resp
     try:
-        return jsonify({"reply": _smart_answer(raw)})
+        _append_history(cid, "user", raw)
+        reply = _smart_answer(raw, _get_history(cid))
+        _append_history(cid, "assistant", reply)
+        resp = make_response(jsonify({"reply": reply}))
+        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
+        return resp
     except Exception as e:
         log.exception("chat error")
-        return jsonify({"reply": f"Sorry, an error occurred ({type(e).__name__})."}), 200
+        resp = make_response(jsonify({"reply": f"Sorry, an error occurred ({type(e).__name__})."}), 200)
+        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
+        return resp
 
+# Optional manual reindex hook
 @app.route("/reindex", methods=["POST"])
 def reindex():
     _ensure_index()
