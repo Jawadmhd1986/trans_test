@@ -19,8 +19,8 @@ RAG_INDEX_PATH = Path("rag_index.npz")
 RAG_META_PATH  = Path("rag_index_meta.json")
 
 # Keep the index small to avoid Render memory limits
-RAG_FOLDERS = ["templates", "static"]   # do not scan '.' or 'generated' to stay light
-RAG_GLOBS = ["*.py","*.js","*.ts","*.html","*.css","*.txt","*.md","*.docx","*.xlsx"]
+RAG_FOLDERS = ["templates", "static"]   # don't scan '.' or 'generated'
+RAG_GLOBS = ["*.py","*.js","*.ts","*.html","*.css","*.txt","*.md","*.docx","*.xlsx","*.pdf"]
 EXCLUDE_DIRS     = {".git", "__pycache__", "node_modules", "generated"}
 CHARS_PER_CHUNK  = 1200
 CHUNK_OVERLAP    = 200
@@ -28,7 +28,7 @@ TOP_K            = 6
 MAX_CONTEXT_CHARS = 12000
 MAX_FILE_BYTES   = 1_500_000    # skip files > 1.5MB
 MAX_TOTAL_CHUNKS = 4000         # cap total chunks in index
-EMBED_BATCH      = 32           # smaller batches to reduce peak RAM
+EMBED_BATCH      = 32           # small batches to reduce peak RAM
 
 # Initialize RAG globals so first /smart_chat call won't NameError
 RAG_VECTORS = np.zeros((0, 1536), dtype=np.float32)
@@ -626,7 +626,6 @@ def _list_files_for_rag():
         for p in base.rglob("*"):
             if not p.is_file():
                 continue
-            # exclude noisy / big trees
             if any(part in EXCLUDE_DIRS for part in p.parts):
                 continue
             if not any(fnmatch.fnmatch(p.name, g) for g in RAG_GLOBS):
@@ -643,6 +642,52 @@ def _list_files_for_rag():
         if k not in seen:
             seen.add(k); uniq.append(p)
     return uniq
+
+def _read_pdf_file(p: Path) -> str:
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(str(p))
+        out = []
+        # Read up to 80 pages to stay light; adjust if needed
+        for i, page in enumerate(reader.pages[:80]):
+            txt = page.extract_text() or ""
+            txt = txt.strip()
+            if txt:
+                out.append(txt)
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+def _file_text_for_rag(p: Path) -> str:
+    suf = p.suffix.lower()
+    if suf in [".txt",".md",".py",".js",".ts",".html",".css"]:
+        try: return p.read_text(encoding="utf-8", errors="ignore")
+        except: return ""
+    if suf == ".docx":
+        try:
+            d=Document(str(p))
+            parts=[]
+            for para in d.paragraphs:
+                if para.text.strip(): parts.append(para.text.strip())
+            for tbl in d.tables:
+                for row in tbl.rows:
+                    cells=[c.text.strip() for c in row.cells]
+                    if any(cells): parts.append(" | ".join(cells))
+            return "\n".join(parts)
+        except: return ""
+    if suf == ".xlsx":
+        try:
+            xls=pd.ExcelFile(str(p))
+            out=[]
+            for sh in xls.sheet_names:
+                df=pd.read_excel(xls,sheet_name=sh,header=None).astype(str)
+                out.append(f"### Sheet: {sh}")
+                out.append(df.head(200).to_csv(index=False,header=False))
+            return "\n".join(out)
+        except: return ""
+    if suf == ".pdf":
+        return _read_pdf_file(p)
+    return ""
 
 def _build_or_load_index_rag():
     if not os.getenv("OPENAI_API_KEY"):
@@ -663,34 +708,7 @@ def _build_or_load_index_rag():
         except: pass
     meta=[]; chunks=[]
     for p in files:
-        # collect chunks with global cap
-        suf=p.suffix.lower()
-        text=""
-        if suf in [".txt",".md",".py",".js",".ts",".html",".css"]:
-            try: text=p.read_text(encoding="utf-8",errors="ignore")
-            except: text=""
-        elif suf==".docx":
-            try:
-                d=Document(str(p))
-                parts=[]
-                for para in d.paragraphs:
-                    if para.text.strip(): parts.append(para.text.strip())
-                for tbl in d.tables:
-                    for row in tbl.rows:
-                        cells=[c.text.strip() for c in row.cells]
-                        if any(cells): parts.append(" | ".join(cells))
-                text="\n".join(parts)
-            except: text=""
-        elif suf==".xlsx":
-            try:
-                xls=pd.ExcelFile(str(p))
-                out=[]
-                for sh in xls.sheet_names:
-                    df=pd.read_excel(xls,sheet_name=sh,header=None).astype(str)
-                    out.append(f"### Sheet: {sh}")
-                    out.append(df.head(200).to_csv(index=False,header=False))
-                text="\n".join(out)
-            except: text=""
+        text=_file_text_for_rag(p)
         if not text: continue
         i, n = 0, len(text)
         while i < n and len(chunks) < MAX_TOTAL_CHUNKS:
@@ -698,8 +716,7 @@ def _build_or_load_index_rag():
             chunks.append(text[i:j]); meta.append({"path": str(p), "text": text[i:j]})
             if j == n: break
             i = max(0, j - CHUNK_OVERLAP)
-        if len(chunks) >= MAX_TOTAL_CHUNKS:
-            break
+        if len(chunks) >= MAX_TOTAL_CHUNKS: break
     if not chunks:
         RAG_META_PATH.write_text(json.dumps({"signature":signature,"meta":[]}))
         np.savez_compressed(RAG_INDEX_PATH, vectors=np.zeros((0,1536),dtype=np.float32))
