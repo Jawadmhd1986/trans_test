@@ -1,44 +1,47 @@
+# app.py
 from flask import Flask, render_template, request, send_file, jsonify
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_LINE_SPACING
-import os, re
+import os, re, logging, json, hashlib, fnmatch
 from datetime import datetime
+from pathlib import Path
+import numpy as np
 import pandas as pd
 from copy import deepcopy
-
-# ==== AI / RAG imports & config (smart /smart_chat endpoint) ====
-import json, hashlib, fnmatch
-import numpy as np
-from pathlib import Path
 from openai import OpenAI
 
+# ---------------- Logging ----------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("dsv-app")
+
+# ---------------- AI / RAG config ----------------
 AI_MODEL = os.getenv("AI_CHAT_MODEL", "gpt-4o-mini")
 EMB_MODEL = os.getenv("AI_EMB_MODEL", "text-embedding-3-small")
 RAG_INDEX_PATH = Path("rag_index.npz")
 RAG_META_PATH  = Path("rag_index_meta.json")
 
-# Keep the index small to avoid Render memory limits
-RAG_FOLDERS = ["templates", "templates/chatbot", "static"]
-  # don't scan '.' or 'generated'
+RAG_FOLDERS = ["templates", "templates/chatbot", "static"]  # explicit chatbot
 RAG_GLOBS = ["*.py","*.js","*.ts","*.html","*.css","*.txt","*.md","*.docx","*.xlsx","*.pdf"]
-EXCLUDE_DIRS     = {".git", "__pycache__", "node_modules", "generated"}
-CHARS_PER_CHUNK  = 1200
-CHUNK_OVERLAP    = 200
-TOP_K            = 6
-MAX_CONTEXT_CHARS = 12000
-MAX_FILE_BYTES   = 1_500_000    # skip files > 1.5MB
-MAX_TOTAL_CHUNKS = 4000         # cap total chunks in index
-EMBED_BATCH      = 32           # small batches to reduce peak RAM
+EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", "generated"}
 
-# Initialize RAG globals so first /smart_chat call won't NameError
+CHARS_PER_CHUNK   = 1200
+CHUNK_OVERLAP     = 200
+TOP_K             = 12
+MAX_CONTEXT_CHARS = 16000
+MAX_FILE_BYTES    = 1_500_000
+MAX_TOTAL_CHUNKS  = 4000
+EMBED_BATCH       = 32
+AI_DEBUG          = os.getenv("AI_DEBUG", "0") == "1"
+
+# pre-init to avoid NameError
 RAG_VECTORS = np.zeros((0, 1536), dtype=np.float32)
 RAG_META = []
-# ================================================================
 
+# ---------------- Flask ----------------
 app = Flask(__name__)
 
-# ---------- Excel matrix ----------
+# ================== Matrix / pricing helpers (unchanged structure) ==================
 TARIFF_PATH = "CL TARIFF - 2025 v3 (004) - UPDATED 6TH AUGUST 2025.xlsx"
 
 def _is_num(x):
@@ -94,7 +97,6 @@ def _pick_rate(bands, volume):
 def index():
     return render_template("form.html")
 
-# ---- pricing for one item ----
 def compute_item(storage_type, volume, days, include_wms, commodity=""):
     st = (storage_type or "").strip()
     st_lower = st.lower()
@@ -132,7 +134,6 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
         unit, rate_unit, rate = "BAG", "BAG / MONTH", 19.0
         storage_fee = volume * days * (rate / 30.0)
 
-    # RMS (Premium / Normal)
     elif st.startswith("RMS — Premium"):
         unit, rate_unit, rate = "BOX", "BOX / MONTH", 5.0
         storage_fee = volume * days * (rate / 30.0)
@@ -140,7 +141,6 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
         unit, rate_unit, rate = "BOX", "BOX / MONTH", 3.0
         storage_fee = volume * days * (rate / 30.0)
 
-    # WMS
     is_open_yard = "open yard" in st_lower
     is_chemical  = "chemical"  in st_lower
     is_rms       = st_lower.startswith("rms")
@@ -159,7 +159,6 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
         "commodity": (commodity or "").strip(),
     }
 
-# --------- commodity helpers ----------
 def _clean_commodity(val: str) -> str:
     s = (val or "").strip()
     if not s: return ""
@@ -167,7 +166,6 @@ def _clean_commodity(val: str) -> str:
         return ""
     return s
 
-# ---------- DOCX helpers ----------
 def find_quote_table(doc):
     for t in doc.tables:
         try:
@@ -312,7 +310,6 @@ def _delete_summary_lines_for_multi(doc):
         el = p._element; pa = el.getparent()
         if pa is not None: pa.remove(el)
 
-# ---- Terms & Conditions helpers ----
 def _append_terms_from_template(path,
                                 terms_heading="Storage Terms and Conditions:",
                                 end_markers=("Validity:", "We trust that")):
@@ -366,7 +363,7 @@ def _strip_marker_text(doc):
                         for r in p.runs: r.text = ""
                         p.add_run(new)
 
-# ---------- ROUTE: generate ----------
+# ---------------- ROUTE: generate ----------------
 @app.route("/generate", methods=["POST"])
 def generate():
     storage_types = request.form.getlist("storage_type") or [request.form.get("storage_type", "")]
@@ -376,7 +373,6 @@ def generate():
     commodities_raw = request.form.getlist("commodity") or [request.form.get("commodity", "")]
     canonical_commodity = next((c for c in (_clean_commodity(v) for v in commodities_raw) if c), "")
 
-    # RMS sub-fields
     rms_tier_list  = request.form.getlist("rms_tier")  or []
     rms_boxes_list = request.form.getlist("rms_boxes") or []
 
@@ -401,8 +397,8 @@ def generate():
             tier = (rms_tier_list[i] or "").strip()
             st_label = ("RMS — Premium FM200 Archiving AC Facility"
                         if "premium" in tier.lower() else "RMS — Normal AC Facility")
-            vol = float(rms_boxes_list[i] or 0)  # boxes
-            inc = True  # WMS always ON for RMS
+            vol = float(rms_boxes_list[i] or 0)
+            inc = True
             items.append(compute_item(st_label, vol, d, inc, com))
             continue
 
@@ -413,7 +409,6 @@ def generate():
             continue
         items.append(compute_item(raw_st, vol, d, inc, com))
 
-    # WMS aggregation for RMS combos
     if len(items) > 1:
         has_rms  = any(it.get("category_rms") for it in items)
         has_std  = any(it.get("category_standard") for it in items)
@@ -462,7 +457,6 @@ def generate():
 
     today_str = datetime.today().strftime("%d %b %Y")
 
-    # Choose template (safe RMS fallback)
     if len(items) == 1:
         st0 = items[0]["storage_type"].lower()
         if "chemical" in st0: template_path = "templates/Chemical VAS.docx"
@@ -483,7 +477,7 @@ def generate():
         unit_for_display = one["unit"]; unit_rate_text = f"{one['rate']:.2f} AED / {one['rate_unit']}"
         wms_status = "" if one["category_openyard"] else ("INCLUDED" if one["include_wms"] else "NOT INCLUDED")
         storage_type_text = one["storage_type"]; days_text = str(one["days"]); volume_text = str(one["volume"])
-        commodity_text = one.get("commodity") or canonical_commodity or "N/A"
+        commodity_text = one.get("commodity") or _clean_commodity(request.form.get("commodity")) or "N/A"
     else:
         st_lines = []
         for it in items:
@@ -493,7 +487,7 @@ def generate():
         storage_type_text = "\n".join(st_lines)
         cm_lines = []
         for it in items:
-            cm = it.get("commodity") or canonical_commodity or "N/A"
+            cm = it.get("commodity") or _clean_commodity(request.form.get("commodity")) or "N/A"
             cm_lines.append(f"{it['storage_type']} — {cm}")
         commodity_text = "\n".join(cm_lines)
         unit_for_display = ""; unit_rate_text = "—"
@@ -617,7 +611,7 @@ def generate():
     doc.save(output_path)
     return send_file(output_path, as_attachment=True)
 
-# -------------------------- SMART /smart_chat (AI + RAG) --------------------------
+# ================== RAG index build ==================
 def _list_files_for_rag():
     files = []
     for folder in RAG_FOLDERS:
@@ -649,8 +643,7 @@ def _read_pdf_file(p: Path) -> str:
         from pypdf import PdfReader
         reader = PdfReader(str(p))
         out = []
-        # Read up to 80 pages to stay light; adjust if needed
-        for i, page in enumerate(reader.pages[:80]):
+        for i, page in enumerate(reader.pages[:120]):
             txt = page.extract_text() or ""
             txt = txt.strip()
             if txt:
@@ -714,7 +707,8 @@ def _build_or_load_index_rag():
         i, n = 0, len(text)
         while i < n and len(chunks) < MAX_TOTAL_CHUNKS:
             j = min(n, i + CHARS_PER_CHUNK)
-            chunks.append(text[i:j]); meta.append({"path": str(p), "text": text[i:j]})
+            chunk_text = text[i:j]
+            chunks.append(chunk_text); meta.append({"path": str(p), "text": chunk_text})
             if j == n: break
             i = max(0, j - CHUNK_OVERLAP)
         if len(chunks) >= MAX_TOTAL_CHUNKS: break
@@ -732,34 +726,54 @@ def _build_or_load_index_rag():
     return vecs, meta
 
 def _ensure_index():
-    """Force rebuild of RAG index every startup to ensure new/changed files are indexed."""
+    """Force rebuild of RAG index every startup."""
     global RAG_VECTORS, RAG_META
-    # Always rebuild, ignore old cache
-    if True:
-        try:
-            os.remove(RAG_INDEX_PATH)
-        except FileNotFoundError:
-            pass
-        try:
-            os.remove(RAG_META_PATH)
-        except FileNotFoundError:
-            pass
+    # always remove old cache
+    try: os.remove(RAG_INDEX_PATH)
+    except FileNotFoundError: pass
+    try: os.remove(RAG_META_PATH)
+    except FileNotFoundError: pass
     RAG_VECTORS, RAG_META = _build_or_load_index_rag()
+    log.info("RAG index rebuilt with %d chunks from %d paths",
+             RAG_VECTORS.shape[0], len({m['path'] for m in RAG_META}))
 
+# ================== Hybrid retrieval & chat ==================
+def _tokenize(s: str):
+    return re.findall(r"[a-z0-9]+", (s or "").lower())
 
 def _retrieve_ctx(q: str, top_k=TOP_K):
+    """Hybrid retriever: semantic similarity + keyword boost (prefers templates/chatbot)."""
     if RAG_VECTORS.shape[0]==0 or not RAG_META:
         return []
     client=OpenAI()
+    # semantic
     qemb=client.embeddings.create(model=EMB_MODEL, input=[q]).data[0].embedding
-    sims=(RAG_VECTORS/(np.linalg.norm(RAG_VECTORS,axis=1,keepdims=True)+1e-9)) @ \
-         (np.array(qemb,dtype=np.float32)/(np.linalg.norm(qemb)+1e-9))
-    idx=sims.argsort()[::-1][:top_k]
-    total=0; out=[]
+    qv = np.array(qemb,dtype=np.float32)
+    qv /= (np.linalg.norm(qv)+1e-9)
+    base = RAG_VECTORS / (np.linalg.norm(RAG_VECTORS,axis=1,keepdims=True)+1e-9)
+    sims = base @ qv
+
+    # keyword
+    q_toks = set(_tokenize(q))  # <-- FIXED (no space)
+    kw_scores = np.zeros(len(RAG_META), dtype=np.float32)
+    for i, md in enumerate(RAG_META):
+        t = md["text"].lower()
+        hit = sum(1 for tok in q_toks if tok and tok in t)
+        bonus = 0.03 * hit
+        if "templates/chatbot" in (md["path"].replace("\\","/")).lower():
+            bonus += 0.05 * hit
+        kw_scores[i] = bonus
+
+    combined = sims + kw_scores
+    idx = combined.argsort()[::-1][:max(top_k, 2*top_k)]
+    total = 0; out=[]
     for i in idx:
-        md=RAG_META[i]; out.append(md); total+=len(md["text"])
-        if total>=MAX_CONTEXT_CHARS: break
-    return out
+        md = RAG_META[i]
+        out.append(md)
+        total += len(md["text"])
+        if total >= MAX_CONTEXT_CHARS:
+            break
+    return out[:top_k]
 
 def _smart_answer(question: str) -> str:
     if not os.getenv("OPENAI_API_KEY"):
@@ -767,9 +781,10 @@ def _smart_answer(question: str) -> str:
                 "Add it in your Render environment to enable the smart chatbot.")
     _ensure_index()
     ctx=_retrieve_ctx(question)
-    blocks=[]; seen=set()
+    blocks=[]; seen=set(); srcs=[]
     for r in ctx:
         p=r["path"]
+        srcs.append(p)
         if p not in seen:
             seen.add(p)
             blocks.append(f"Source: {p}\n{r['text']}")
@@ -785,7 +800,11 @@ def _smart_answer(question: str) -> str:
         messages=[{"role":"system","content":system},{"role":"user","content":user}],
         temperature=0.2,
     )
-    return resp.choices[0].message.content.strip()
+    answer = resp.choices[0].message.content.strip()
+    if AI_DEBUG and srcs:
+        uniq = list(dict.fromkeys(srcs))[:5]
+        answer += "\n\n[Sources]\n" + "\n".join(uniq)
+    return answer
 
 @app.route("/smart_chat", methods=["POST"])
 def smart_chat():
@@ -796,9 +815,9 @@ def smart_chat():
     try:
         return jsonify({"reply": _smart_answer(message)})
     except Exception as e:
+        log.exception("smart_chat error")
         return jsonify({"reply": f"Sorry, an error occurred ({type(e).__name__})."}), 200
 
-# Backward-compatible /chat that forwards to smart endpoint
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
@@ -808,7 +827,17 @@ def chat():
     try:
         return jsonify({"reply": _smart_answer(raw)})
     except Exception as e:
+        log.exception("chat error")
         return jsonify({"reply": f"Sorry, an error occurred ({type(e).__name__})."}), 200
+
+@app.route("/reindex", methods=["POST"])
+def reindex():
+    _ensure_index()
+    return jsonify({
+        "ok": True,
+        "chunks": int(RAG_VECTORS.shape[0]),
+        "paths": len({m['path'] for m in RAG_META})
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
