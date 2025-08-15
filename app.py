@@ -19,7 +19,8 @@ RAG_INDEX_PATH = Path("rag_index.npz")
 RAG_META_PATH  = Path("rag_index_meta.json")
 
 # Keep the index small to avoid Render memory limits
-RAG_FOLDERS = ["templates", "static"]   # don't scan '.' or 'generated'
+RAG_FOLDERS = ["templates", "templates/chatbot", "static"]
+  # don't scan '.' or 'generated'
 RAG_GLOBS = ["*.py","*.js","*.ts","*.html","*.css","*.txt","*.md","*.docx","*.xlsx","*.pdf"]
 EXCLUDE_DIRS     = {".git", "__pycache__", "node_modules", "generated"}
 CHARS_PER_CHUNK  = 1200
@@ -731,9 +732,20 @@ def _build_or_load_index_rag():
     return vecs, meta
 
 def _ensure_index():
+    """Force rebuild of RAG index every startup to ensure new/changed files are indexed."""
     global RAG_VECTORS, RAG_META
-    if RAG_VECTORS.shape[0]==0 or not RAG_META:
-        RAG_VECTORS, RAG_META = _build_or_load_index_rag()
+    # Always rebuild, ignore old cache
+    if True:
+        try:
+            os.remove(RAG_INDEX_PATH)
+        except FileNotFoundError:
+            pass
+        try:
+            os.remove(RAG_META_PATH)
+        except FileNotFoundError:
+            pass
+    RAG_VECTORS, RAG_META = _build_or_load_index_rag()
+
 
 def _retrieve_ctx(q: str, top_k=TOP_K):
     if RAG_VECTORS.shape[0]==0 or not RAG_META:
