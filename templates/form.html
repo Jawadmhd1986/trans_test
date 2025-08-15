@@ -4,69 +4,73 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>DSV Quotation Generator</title>
-
-  <!-- Main stylesheet -->
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
 </head>
 <body>
-
   <div class="quote-section">
     <!-- Floating DSV logo -->
-    <img src="{{ url_for('static', filename='dsv_logo.png') }}"
-         alt="DSV Logo"
-         class="dsv-logo" />
+    <img src="{{ url_for('static', filename='dsv_logo.png') }}" alt="DSV Logo" class="dsv-logo" />
 
-    <!-- White card container -->
+    <!-- White card -->
     <div class="quote-card">
       <h1>Quotation Generator</h1>
-      <form action="{{ url_for('generate') }}" method="post">
-        <label for="storage">Storage Type</label>
-        <select id="storage" name="storage_type" required>
-          <option value="">— Select —</option>
 
-          <!-- Standard -->
-          <option>AC</option>
-          <option>Non-AC</option>
-          <option>Open Shed</option>
+      <form action="{{ url_for('generate') }}" method="post" id="quote-form">
+        <!-- Container for multiple storage items -->
+        <div id="storage-items">
+          <div class="storage-item">
+            <div class="item-row">
+              <label>Commodity</label>
+              <input type="text" name="commodity" placeholder="e.g., Furniture / Machinery" required />
+            </div>
 
-          <!-- Chemical -->
-          <option>Chemicals AC</option>
-          <option>Chemicals Non-AC (Non-DG)</option>
-          <option>Chemicals Non-AC (DG)</option>
+            <div class="item-row">
+              <label>Storage Type</label>
+              <select name="storage_type" required>
+                <option value="">— Select —</option>
+                <option>AC</option>
+                <option>Non-AC</option>
+                <option>Open Shed</option>
+                <option>Chemicals AC</option>
+                <option>Chemicals Non-AC (Non-DG)</option>
+                <option>Chemicals Non-AC (DG)</option>
+                <option>Open Yard – KIZAD</option>
+                <option>Open Yard – Mussafah (Open Yard)</option>
+                <option>Open Yard – Mussafah (Open Yard Shed)</option>
+                <option>Open Yard – Mussafah (Jumbo Bag)</option>
+              </select>
+            </div>
 
-          <!-- Open Yard -->
-          <option>Open Yard – KIZAD</option>
-          <!-- replaced the single Mussafah option with 3 choices -->
-          <option>Open Yard – Mussafah (Open Yard)</option>
-          <option>Open Yard – Mussafah (Open Yard Shed)</option>
-          <option>Open Yard – Mussafah (Jumbo Bag)</option>
-        </select>
+            <div class="item-row">
+              <label>Volume (CBM or SQM)</label>
+              <input type="number" step="0.01" name="volume" required />
+            </div>
 
-        <label for="volume">Volume (CBM or SQM)</label>
-        <input type="number" step="0.01" id="volume" name="volume" required />
+            <div class="item-row">
+              <label>Duration (Days)</label>
+              <input type="number" name="days" required />
+            </div>
 
-        <label for="days">Duration (Days)</label>
-        <input type="number" id="days" name="days" required />
+            <div class="item-row">
+              <label>Include WMS?</label>
+              <select name="wms" required>
+                <option>Yes</option>
+                <option>No</option>
+              </select>
+            </div>
 
-        <label for="wms">Include WMS?</label>
-        <select id="wms" name="wms" required>
-          <option>Yes</option>
-          <option>No</option>
-        </select>
+            <button type="button" class="btn-remove" style="display:none">Remove</button>
+          </div>
+        </div>
 
-        <label for="commodity">Commodity</label>
-        <input type="text" id="commodity" name="commodity" placeholder="e.g., Furniture / Machinery" required>
-
-        <button type="submit" class="btn-generate">
-          Generate
-        </button>
+        <button type="button" id="add-item" class="btn-secondary">+ Add another storage</button>
+        <button type="submit" class="btn-generate">Generate</button>
       </form>
     </div>
 
-    <!-- Chat toggle button -->
+    <!-- Chat toggle -->
     <button class="chat-toggle">
-      <img src="{{ url_for('static', filename='chat-icon.png') }}"
-           alt="Chat with DSV" />
+      <img src="{{ url_for('static', filename='chat-icon.png') }}" alt="Chat with DSV" />
     </button>
 
     <!-- Chat widget -->
@@ -83,23 +87,50 @@
     </div>
   </div>
 
-  <!-- Chat logic -->
+  <!-- Chat logic (unchanged) -->
   <script src="{{ url_for('static', filename='chatbot.js') }}"></script>
 
-  <!-- (kept exactly as you had it) demo block -->
-  <div class="chat-window">
-    <div class="message bot">
-      <div class="message-text">DSV operates a large fleet in the UAE including:
-- 🛻 Flatbed trailers
-- 📦 Box trucks
-- 🚚 Double trailers
-- ❄️ Reefer trucks (chiller/freezer)
-- 🏗️ Lowbeds
-- 🪣 Tippers
-- 🚐 Small city delivery trucks
+  <!-- Clone/remove storage items -->
+  <script>
+    (function () {
+      const container = document.getElementById("storage-items");
+      const addBtn = document.getElementById("add-item");
 
-Fleet vehicles support all types of transport including full truckload (FTL), LTL, and container movements.</div>
-    </div>
-  </div>
+      function wireRemove(btn) {
+        btn.addEventListener("click", () => {
+          const block = btn.closest(".storage-item");
+          block.remove();
+          // Ensure the very first block has no Remove button
+          [...container.querySelectorAll(".storage-item")].forEach((blk, i) => {
+            const b = blk.querySelector(".btn-remove");
+            if (b) b.style.display = i === 0 ? "none" : "inline-block";
+          });
+        });
+      }
+
+      addBtn.addEventListener("click", () => {
+        const first = container.querySelector(".storage-item");
+        const clone = first.cloneNode(true);
+
+        // reset all inputs/selects inside the clone
+        clone.querySelectorAll("input").forEach(i => (i.value = ""));
+        clone.querySelectorAll("select").forEach(s => (s.selectedIndex = 0));
+
+        // show remove button on clones
+        const rm = clone.querySelector(".btn-remove");
+        rm.style.display = "inline-block";
+        wireRemove(rm);
+
+        container.appendChild(clone);
+
+        // keep first block's remove hidden
+        const firstRm = first.querySelector(".btn-remove");
+        if (firstRm) firstRm.style.display = "none";
+      });
+
+      // wire the initial (hidden) remove button for future visibility changes
+      wireRemove(container.querySelector(".storage-item .btn-remove"));
+    })();
+  </script>
 </body>
 </html>
