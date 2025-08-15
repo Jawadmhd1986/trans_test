@@ -1,3 +1,5 @@
+// static/chatbot.js
+
 // Fix for mobile viewport height
 window.addEventListener('load', () => {
   let vh = window.innerHeight * 0.01;
@@ -8,7 +10,6 @@ window.addEventListener('resize', () => {
   document.documentElement.style.setProperty('--vh', `${vh}px`);
 });
 
-// Main chatbot logic
 document.addEventListener('DOMContentLoaded', () => {
   const chatBox    = document.getElementById('chat-box');
   const chatToggle = document.querySelector('.chat-toggle');
@@ -17,14 +18,15 @@ document.addEventListener('DOMContentLoaded', () => {
   const inputEl    = document.getElementById('chat-input');
   const msgsEl     = document.getElementById('chat-messages');
 
-  // Preferred endpoints (AI+RAG first, then legacy rules)
-  const AI_ENDPOINT     = '/smart_chat';
-  const LEGACY_ENDPOINT = '/chat';
+  const AI_ENDPOINT     = '/smart_chat';   // one endpoint only (no double round-trip)
+  const FAST_MODE       = true;            // show replies immediately
+  const TYPE_SPEED_MS   = 6;               // used only if we enable typewriter for short texts
+  const TYPE_MAX_CHARS  = 160;             // only typewriter for very short answers
 
-  chatToggle.addEventListener('click', () => chatBox.classList.toggle('open'));
-  chatClose .addEventListener('click', () => chatBox.classList.remove('open'));
-  sendBtn   .addEventListener('click', sendMessage);
-  inputEl   .addEventListener('keydown', e => {
+  chatToggle?.addEventListener('click', () => chatBox.classList.toggle('open'));
+  chatClose ?.addEventListener('click', () => chatBox.classList.remove('open'));
+  sendBtn   ?.addEventListener('click', sendMessage);
+  inputEl   ?.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
@@ -32,40 +34,28 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   async function sendMessage() {
-    const text = inputEl.value.trim();
+    const text = (inputEl.value || '').trim();
     if (!text) return;
     appendMessage('user', text);
     inputEl.value = '';
 
+    // show a quick "thinking" bubble so users see instant response
+    const thinkingId = appendMessage('bot', '…', false, true);
+
     try {
-      // Try smart AI endpoint first
-      let reply = await askServer(AI_ENDPOINT, text);
-
-      // Auto–fallback to legacy rules if AI is disabled/quota exceeded/404/etc.
-      if (!reply || /AI answers are disabled|quota exceeded|not found/i.test(reply)) {
-        reply = await askServer(LEGACY_ENDPOINT, text);
-      }
-
-      appendMessage('bot', reply ?? 'Sorry, something went wrong.', true);
-    } catch {
-      appendMessage('bot', 'Sorry, something went wrong.');
-    }
-  }
-
-  async function askServer(endpoint, text) {
-    try {
-      const res = await fetch(endpoint, {
+      const res = await fetch(AI_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text })
       });
-      // Non-2xx may still return JSON; try to parse
-      let data;
+      let data = {};
       try { data = await res.json(); } catch { data = {}; }
-      const reply = data.reply ?? (await res.text?.()) ?? '';
-      return String(reply || '').trim();
+      const reply = String(data.reply || 'Sorry, something went wrong.').trim();
+
+      // replace thinking bubble
+      replaceMessage(thinkingId, reply);
     } catch {
-      return '';
+      replaceMessage(thinkingId, 'Sorry, something went wrong.');
     }
   }
 
@@ -82,25 +72,73 @@ document.addEventListener('DOMContentLoaded', () => {
     return out;
   }
 
-  // --- HTML-safe typewriter: types text chars, injects tags instantly (so links stay intact) ---
-  function typeHTML(html, el, speed = 15) {
-    const parts = html.split(/(<[^>]+>)/g).filter(Boolean); // tags/text
+  // Append message bubble; returns a message id
+  let _msgCounter = 0;
+  function appendMessage(sender, text, typewriter = false, isThinking = false) {
+    const id = `msg_${++_msgCounter}`;
+    const wrapper = document.createElement('div');
+    wrapper.className = `message ${sender}`;
+    wrapper.dataset.mid = id;
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    wrapper.appendChild(bubble);
+    msgsEl.appendChild(wrapper);
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+
+    if (isThinking) {
+      bubble.textContent = text;
+      return id;
+    }
+
+    const safeHTML = renderWithLinksAndBreaks(text);
+
+    // Fast mode: render immediately
+    if (FAST_MODE) {
+      bubble.innerHTML = safeHTML;
+      msgsEl.scrollTop = msgsEl.scrollHeight;
+      return id;
+    }
+
+    // Optional typewriter only for short answers
+    const short = text.length <= TYPE_MAX_CHARS;
+    if (sender === 'bot' && typewriter && short) {
+      typeHTML(safeHTML, bubble, TYPE_SPEED_MS);
+    } else {
+      bubble.innerHTML = safeHTML;
+    }
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+    return id;
+  }
+
+  // Replace an existing message bubble by id
+  function replaceMessage(id, newText) {
+    const node = msgsEl.querySelector(`[data-mid="${id}"] .bubble`);
+    if (!node) return;
+    const safeHTML = renderWithLinksAndBreaks(newText);
+    if (FAST_MODE || newText.length > TYPE_MAX_CHARS) {
+      node.innerHTML = safeHTML;
+    } else {
+      node.innerHTML = '';
+      typeHTML(safeHTML, node, TYPE_SPEED_MS);
+    }
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+  }
+
+  // HTML-safe typewriter: tags injected instantly, text chars typed
+  function typeHTML(html, el, speed = 8) {
+    const parts = html.split(/(<[^>]+>)/g).filter(Boolean);
     let pIndex = 0, cIndex = 0;
 
     function step() {
       if (pIndex >= parts.length) return;
-
       const part = parts[pIndex];
 
       if (part.startsWith('<')) {
-        // append full tag immediately
         el.innerHTML += part;
-        pIndex++;
-        cIndex = 0;
+        pIndex++; cIndex = 0;
         msgsEl.scrollTop = msgsEl.scrollHeight;
-        setTimeout(step, speed);
+        setTimeout(step, 0);
       } else {
-        // type text content character-by-character
         if (cIndex <= part.length) {
           if (!el.lastChild || el.lastChild.nodeName !== 'SPAN' || !el.lastChild.classList.contains('tw')) {
             const span = document.createElement('span');
@@ -112,38 +150,16 @@ document.addEventListener('DOMContentLoaded', () => {
           cIndex++;
           setTimeout(step, speed);
         } else {
-          // finish this text part: replace typing span with a plain text node
           const span = el.lastChild;
           if (span && span.classList && span.classList.contains('tw')) {
             const txt = document.createTextNode(span.textContent);
             el.replaceChild(txt, span);
           }
-          pIndex++;
-          cIndex = 0;
-          setTimeout(step, speed);
+          pIndex++; cIndex = 0;
+          setTimeout(step, 0);
         }
       }
     }
     step();
-  }
-
-  // Append message bubble
-  function appendMessage(sender, text, typewriter = false) {
-    const wrapper = document.createElement('div');
-    wrapper.className = `message ${sender}`;
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble';
-    wrapper.appendChild(bubble);
-    msgsEl.appendChild(wrapper);
-    msgsEl.scrollTop = msgsEl.scrollHeight;
-
-    if (sender === 'bot' && typewriter) {
-      const safeHTML = renderWithLinksAndBreaks(text);
-      bubble.innerHTML = '';
-      typeHTML(safeHTML, bubble, 15);
-      return;
-    }
-
-    bubble.textContent = text; // user or non-typewriter bot
   }
 });
