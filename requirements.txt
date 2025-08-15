@@ -13,7 +13,7 @@ python-dotenv==1.1.1
 requests==2.32.3
 pandas==2.2.2
 openpyxl==3.1.5
-docx
 openai>=1.35.0
 numpy>=1.26
 gunicorn==21.2.0
+
