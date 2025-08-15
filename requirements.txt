@@ -16,4 +16,5 @@ openpyxl==3.1.5
 openai>=1.35.0
 numpy>=1.26
 gunicorn==21.2.0
-pdfminer.six>=20231228
+pypdf>=4.2.0
+
