@@ -754,7 +754,7 @@ def _ensure_index():
 # ==== Build index at process start (NOT per request) ====
 _ensure_index()
 
-# ================== Storage-rate intent (NEW) ==================
+# ================== Deterministic intents ==================
 def _fmt_num(x):
     try:
         if x == float("inf"): return "∞"
@@ -767,7 +767,7 @@ def _format_bands(label, bands):
     if not bands: return f"{label}: (no data)"
     rows = []
     for f, t, r in bands:
-        rows.append(f"• {_fmt_num(f)}–{_fmt_num(t)} CBM: {r:.2f} AED / CBM / DAY")
+        rows.append(f"- {_fmt_num(f)}–{_fmt_num(t)} CBM: {r:.2f} AED / CBM / DAY")
     return f"{label}:\n" + "\n".join(rows)
 
 def _storage_rate_text_for_standard(kind):
@@ -780,8 +780,8 @@ def _storage_rate_text_for_standard(kind):
                 "Please ensure the Excel tariff file is present and readable.")
     parts = [
         f"Standard {kind} storage rates (AED / CBM / DAY):",
-        _format_bands("• Period < 30 days", lt),
-        _format_bands("• Period ≥ 30 days", ge),
+        _format_bands("• Period < 30 days", lt).replace("• ", ""),
+        _format_bands("• Period ≥ 30 days", ge).replace("• ", ""),
         "Note: The band applies based on your CBM and storage duration."
     ]
     return "\n".join(parts)
@@ -842,7 +842,6 @@ def answer_storage_rate_intent(question, history_msgs):
         return spec
     return ""
 
-# ================== Fleet intent (NEW) ==================
 def answer_fleet_intent(question, history_msgs):
     anchor = _history_text_for_query(history_msgs)
     s = f"{question} {anchor}".lower()
@@ -850,16 +849,34 @@ def answer_fleet_intent(question, history_msgs):
         return ""
     return (
         "DSV fleet summary:\n"
-        "• Flatbeds — general cargo & containers (≈22–25 tons)\n"
-        "• Lowbeds — heavy/oversized machinery (up to ≈60 tons)\n"
-        "• Tippers — bulk materials (≈15–20 tons)\n"
-        "• Box trucks — weather-protected goods (≈5–10 tons)\n"
-        "• Reefer trucks — +2°C to –22°C cold chain (≈3–12 tons)\n"
-        "• Double trailers — high-volume long-haul (≈50–60 tons total)\n"
-        "• Small city trucks — last-mile (≈1–3 tons)"
+        "- Flatbeds — general cargo & containers (~22–25 tons)\n"
+        "- Lowbeds — heavy/oversized machinery (up to ~60 tons)\n"
+        "- Tippers — bulk materials (~15–20 tons)\n"
+        "- Box trucks — weather-protected goods (~5–10 tons)\n"
+        "- Reefer trucks — +2°C to –22°C cold chain (~3–12 tons)\n"
+        "- Double trailers — high-volume long-haul (~50–60 tons total)\n"
+        "- Small city trucks — last-mile (~1–3 tons)"
     )
 
-# ================== Hybrid retrieval & chat ==================
+def answer_21k_intent(question, history_msgs):
+    anchor = _history_text_for_query(history_msgs)
+    s = f"{question} {anchor}".lower()
+    if "21k" not in s: 
+        return ""
+    if not (("warehouse" in s) or ("mussafah" in s) or ("dsv" in s)):
+        return ""
+    return (
+        "DSV 21K warehouse (Mussafah) — key facts:\n"
+        "- Size & height: 21,000 sqm, ~15 m clear height\n"
+        "- Racking: Selective, VNA, Drive-in; racks ~12 m with 6 pallet levels\n"
+        "- Aisle widths: Selective 2.95–3.3 m; VNA 1.95 m; Drive-in 2.0 m\n"
+        "- Per-bay capacity: 14 Standard pallets or 21 Euro pallets\n"
+        "- Chambers: 7 (clients incl. ADNOC, ZARA, PSN, Civil Defense)\n"
+        "- RMS area: FM-200 protected archiving zone inside 21K\n"
+        "- Certifications: GDSP/ISO-aligned security & safety systems"
+    )
+
+# ================== Retrieval & bullet safety ==================
 def _tokenize(s: str):
     return re.findall(r"[a-z0-9]+", (s or "").lower())
 
@@ -903,6 +920,63 @@ def _retrieve_ctx(query_str: str, top_k=TOP_K):
             break
     return out[:top_k]
 
+def _ctx_text_from_blocks(ctx_blocks, limit=4000):
+    parts = []
+    total = 0
+    for md in ctx_blocks:
+        t = (md.get("text") or "").strip()
+        if not t: 
+            continue
+        if total + len(t) > limit:
+            t = t[: max(0, limit - total)]
+        parts.append(t)
+        total += len(t)
+        if total >= limit:
+            break
+    return "\n\n---\n\n".join(parts)
+
+def _needs_bullets(ans: str) -> bool:
+    if not ans or not ans.strip():
+        return True
+    s = ans.strip()
+    # If it ends with ':' or looks like a bare "summary/overview/specs" header
+    header_only = re.fullmatch(r"(?is)\s*([A-Za-z0-9 \-\(\)\/&]+:)\s*", s) is not None
+    says_summary = re.search(r"(?i)\b(summary|overview|specifications|specs|includes|the following)\b\s*:?\s*$", s) is not None
+    has_bullets = re.search(r"\n\s*(?:[-•*]|\d+\.)\s", s) is not None
+    return (header_only or says_summary) and not has_bullets
+
+def _bulletize_with_llm(question: str, ctx_blocks: list, draft_heading: str = "") -> str:
+    client = OpenAI()
+    context = _ctx_text_from_blocks(ctx_blocks, limit=3500)
+    heading = draft_heading.strip() if draft_heading else ""
+    system = (
+        "Rewrite the answer as a concise bullet list using ONLY the provided context. "
+        "Return 5–12 bullets. No preamble, no closing line, no extra commentary."
+    )
+    user = f"Question: {question}\n\nContext:\n{context}\n\n{('Heading: ' + heading) if heading else ''}\n\nWrite only bullet points:"
+    resp = client.chat.completions.create(
+        model=AI_MODEL,
+        messages=[{"role":"system","content":system}, {"role":"user","content":user}],
+        temperature=0.1,
+        max_tokens=220
+    )
+    return resp.choices[0].message.content.strip()
+
+def _maybe_force_bullets(question: str, ctx_blocks: list, ans: str) -> str:
+    if not _needs_bullets(ans):
+        return ans
+    # special-case deterministic topics
+    fleet = answer_fleet_intent(question, [])
+    if fleet and re.search(r"(?i)fleet|trailer|truck", question):
+        return fleet
+    w21k = answer_21k_intent(question, [])
+    if w21k and re.search(r"(?i)21k|mussafah", question):
+        return w21k
+    # otherwise generate bullets from same context
+    bulletized = _bulletize_with_llm(question, ctx_blocks, draft_heading=ans)
+    return bulletized or ans
+
+# ================== LLM answering ==================
 def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str:
     client=OpenAI()
     blocks=[]; seen=set(); srcs=[]
@@ -930,6 +1004,8 @@ def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str
         max_tokens=300
     )
     ans = resp.choices[0].message.content.strip()
+    # enforce bullets if needed
+    ans = _maybe_force_bullets(question, ctx_blocks, ans)
     if TAG_SOURCES:
         ans = "[From files] " + ans
     if AI_DEBUG and srcs:
@@ -953,6 +1029,8 @@ def _llm_general_answer(question: str, history_msgs: list) -> str:
         max_tokens=250
     )
     ans = resp.choices[0].message.content.strip()
+    # try to bulletize generic answers too if the model returned just a heading
+    ans = _maybe_force_bullets(question, [], ans)
     if TAG_SOURCES:
         ans = "[General knowledge] " + ans
     return ans
@@ -973,6 +1051,7 @@ def _smart_answer(question: str, history_msgs: list) -> str:
     # NEW: fast deterministic intents first
     pre = (
         answer_fleet_intent(question, history_msgs) or
+        answer_21k_intent(question, history_msgs) or
         answer_storage_rate_intent(question, history_msgs)
     )
     if pre:
@@ -986,7 +1065,10 @@ def _smart_answer(question: str, history_msgs: list) -> str:
     if not _has_strong_ctx(ctx, question):
         if STRICT_LOCAL:
             return "I don’t have this in your saved files."
-        return _llm_general_answer(question, history_msgs)
+        ans = _llm_general_answer(question, history_msgs)
+        if _is_nonanswer(ans) and STRICT_LOCAL:
+            return "I don’t have this in your saved files."
+        return ans
 
     ans = _answer_with_ctx(question, ctx, history_msgs)
     if _is_nonanswer(ans):
