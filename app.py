@@ -66,10 +66,12 @@ def _append_history(cid, role, content):
 def _history_text_for_query(hist, max_chars=600):
     if not hist:
         return ""
-    last_user = [m["content"] for m in hist if m["role"]=="user"][-3:]
-    last_asst = [m["content"] for m in hist if m["role"]=="assistant"][-1:] if any(m["role"]=="assistant") else []
+    last_user = [m.get("content", "") for m in hist if m.get("role") == "user"][-3:]
+    asst_msgs = [m.get("content", "") for m in hist if m.get("role") == "assistant"]
+    last_asst = asst_msgs[-1:] if asst_msgs else []
     blob = " | ".join(last_user + last_asst)
     return blob[-max_chars:]
+
 
 def _should_use_anchor(question: str) -> bool:
     s = (question or "").strip().lower()
