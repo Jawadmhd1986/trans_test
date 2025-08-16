@@ -64,19 +64,21 @@ def _append_history(cid, role, content):
     CONV[cid] = hist
 
 def _history_text_for_query(hist, max_chars=600):
+    """
+    Build a compact anchor from recent turns to keep follow-ups on topic.
+    """
     if not hist:
         return ""
-    last_user = [m.get("content", "") for m in hist if m.get("role") == "user"][-3:]
-    asst_msgs = [m.get("content", "") for m in hist if m.get("role") == "assistant"]
-    last_asst = asst_msgs[-1:] if asst_msgs else []
+    last_user = [m.get("content","") for m in hist if m.get("role") == "user"][-3:]
+    last_asst = [m.get("content","") for m in hist if m.get("role") == "assistant"][-1:]
     blob = " | ".join(last_user + last_asst)
     return blob[-max_chars:]
 
-
 def _should_use_anchor(question: str) -> bool:
+    """Use history only for short follow-ups (e.g., 'how many km?', 'non ac?')."""
     s = (question or "").strip().lower()
     if len(s.split()) <= 5: return True
-    if re.search(r"\b(how many|how much|what rate|which one|and|it|them|that)\b", s): return True
+    if re.search(r"\b(how many|how much|what rate|which one|and|it|them|that|those|list|types|services)\b", s): return True
     return False
 
 # ---------------- Flask ----------------
@@ -138,7 +140,7 @@ def index():
 
 def compute_item(storage_type, volume, days, include_wms, commodity=""):
     st = (storage_type or "").strip()
-    st_lower = st.lower()
+    st_lower = st.lower().replace('—','-')  # normalize dashes
     period_lt_1m = days < 30
     rate = 0.0
     unit, rate_unit = "CBM", "CBM / DAY"
@@ -159,7 +161,7 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
     elif st == "Chemicals Non-AC":
         rate = 2.5; storage_fee = volume * days * rate
 
-    elif "open yard – kizad" in st_lower:
+    elif ("open yard" in st_lower and "kizad" in st_lower):
         rate, unit, rate_unit = 125.0, "SQM", "SQM / YEAR"
         storage_fee = volume * days * (rate / 365.0)
     elif st == "Open Yard – Mussafah (Open Yard)":
@@ -172,10 +174,10 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
         unit, rate_unit, rate = "BAG", "BAG / MONTH", 19.0
         storage_fee = volume * days * (rate / 30.0)
 
-    elif st.startswith("RMS — Premium"):
+    elif st_lower.startswith("rms - premium"):
         unit, rate_unit, rate = "BOX", "BOX / MONTH", 5.0
         storage_fee = volume * days * (rate / 30.0)
-    elif st.startswith("RMS — Normal"):
+    elif st_lower.startswith("rms - normal"):
         unit, rate_unit, rate = "BOX", "BOX / MONTH", 3.0
         storage_fee = volume * days * (rate / 30.0)
 
@@ -438,7 +440,7 @@ def generate():
             continue
         items.append(compute_item(raw_st, vol, d, inc, com))
 
-    # (WMS combo aggregation logic omitted here for brevity—keep your working version)
+    # (Combo WMS aggregation can be pasted here if you need it; omitted for brevity.)
 
     if not items:
         items = [compute_item("AC", 0.0, 0, False)]
@@ -449,10 +451,8 @@ def generate():
         st0 = items[0]["storage_type"].lower()
         if "chemical" in st0: template_path = "templates/Chemical VAS.docx"
         elif "open yard" in st0: template_path = "templates/Open Yard VAS.docx"
-        elif st0.startswith("rms"):
-            template_path = "templates/RMS VAS.docx" if _safe_docx("templates/RMS VAS.docx") else "templates/Standard VAS.docx"
-        else:
-            template_path = "templates/Standard VAS.docx"
+        elif st0.startswith("rms"): template_path = "templates/RMS VAS.docx" if _safe_docx("templates/RMS VAS.docx") else "templates/Standard VAS.docx"
+        else: template_path = "templates/Standard VAS.docx"
     else:
         template_path = "templates/Standard VAS.docx"
     doc = Document(template_path)
@@ -507,7 +507,7 @@ def generate():
                     for p in cell.paragraphs: replace_in_paragraph(p, mapping)
 
     replace_all(doc, placeholders)
-    qt = _rebuild_quotation_table(doc, items, grand_total)
+    _rebuild_quotation_table(doc, items, grand_total)
 
     os.makedirs("generated", exist_ok=True)
     filename = f"Quotation_{(request.form.get('commodity') or 'quotation').strip() or 'quotation'}.docx"
@@ -627,53 +627,68 @@ def _ensure_index():
 # Build index once at startup
 _ensure_index()
 
-# ================== Deterministic intents (non-sticky) ==================
-def answer_fleet_intent(question, _history_msgs):
+# ================== Deterministic intents (non-sticky where needed) ==================
+def answer_fleet_intent(question, _history):
     s = (question or "").lower()
     if not re.search(r"\b(fleet|truck(?:s)? types?|vehicle(?:s)? types?|transport fleet|our fleet)\b", s): return ""
     return (
         "DSV fleet summary:\n"
-        "- Flatbeds - general cargo and containers (~22-25 tons)\n"
-        "- Lowbeds - heavy/oversized machinery (up to ~60 tons)\n"
-        "- Tippers - bulk materials (~15-20 tons)\n"
-        "- Box trucks - weather-protected goods (~5-10 tons)\n"
-        "- Reefer trucks - +2 to -22 C cold chain (~3-12 tons)\n"
-        "- Double trailers - high-volume long-haul (~50-60 tons total)\n"
-        "- Small city trucks - last-mile (~1-3 tons)"
+        "- Flatbeds — general cargo & containers (~22–25 tons)\n"
+        "- Lowbeds — heavy/oversized machinery (up to ~60 tons)\n"
+        "- Tippers — bulk materials (~15–20 tons)\n"
+        "- Box trucks — weather-protected goods (~5–10 tons)\n"
+        "- Reefer trucks — +2°C to –22°C cold chain (~3–12 tons)\n"
+        "- Double trailers — high-volume long-haul (~50–60 tons total)\n"
+        "- Small city trucks — last-mile (~1–3 tons)"
     )
 
-def answer_21k_intent(question, _history_msgs):
+def answer_21k_intent(question, _history):
     s = (question or "").lower()
     if "21k" not in s: return ""
     if not (("warehouse" in s) or ("mussafah" in s) or ("dsv" in s)): return ""
     return (
-        "DSV 21K warehouse (Mussafah) - key facts:\n"
-        "- Size and height: 21,000 sqm, ~15 m clear height\n"
+        "DSV 21K warehouse (Mussafah) — key facts:\n"
+        "- Size & height: 21,000 sqm, ~15 m clear height\n"
         "- Racking: Selective, VNA, Drive-in; racks ~12 m with 6 pallet levels\n"
-        "- Aisle widths: Selective 2.95-3.3 m; VNA 1.95 m; Drive-in 2.0 m\n"
+        "- Aisle widths: Selective 2.95–3.3 m; VNA 1.95 m; Drive-in 2.0 m\n"
         "- Per-bay capacity: 14 Standard pallets or 21 Euro pallets\n"
         "- Chambers: 7 (clients incl. ADNOC, ZARA, PSN, Civil Defense)\n"
         "- RMS area: FM-200 protected archiving zone inside 21K\n"
-        "- Certifications: GDSP/ISO-aligned security and safety systems"
+        "- Certifications: GDSP/ISO-aligned security & safety systems"
     )
 
-def answer_container_intent(question, _history_msgs):
-    s = (question or "").lower()
+def answer_container_intent(question, history_msgs):
+    """
+    Deterministic container specs/list. Uses recent history so follow-ups like
+    'list them down for me' after 'containers' still return the list.
+    """
+    anchor = _history_text_for_query(history_msgs, max_chars=600)
+    s = f"{question} {anchor}".lower()
     is_20 = bool(re.search(r"\b20\s*ft\b|\b20ft\b|\b20\s*feet\b", s))
     is_40 = bool(re.search(r"\b40\s*ft\b|\b40ft\b|\b40\s*feet\b", s))
     is_hc = bool(re.search(r"\bhc\b|high\s*cube", s))
-    is_reefer = "reefer" in s or "refrigerated" in s
+    is_reefer = ("reefer" in s) or ("refrigerated" in s)
     is_open_top = "open top" in s
     is_flat_rack = "flat rack" in s
-    if not any([is_20,is_40,is_hc,is_reefer,is_open_top,is_flat_rack]) and "container" not in s: return ""
+    asks_container = any(kw in s for kw in [
+        "container", "containers", "container size", "container sizes",
+        "container types", "types of container", "list them", "list types",
+        "show types", "show sizes", "give me containers"
+    ]) or is_20 or is_40 or is_hc or is_reefer or is_open_top or is_flat_rack
+    if not asks_container: return ""
     if is_reefer:
-        return ("Reefer container:\n- Sizes: 20ft and 40ft\n- Temp: +2 to -25 C\n- Use: food/pharma/perishables\n- Example 40ft: 12.2m x 2.44m x 2.59m (~67 CBM)")
-    if is_open_top: return ("Open Top container (20ft/40ft):\n- Tarpaulin roof, same base dims\n- Top loading via crane/forklift\n- Ideal for tall cargo")
-    if is_flat_rack: return ("Flat Rack container:\n- No sides/roof\n- For oversized cargo (vehicles, generators, heavy equipment)")
-    if is_40 and is_hc: return ("40ft High Cube:\n- 12.2m x 2.44m x 2.90m\n- ~76 CBM\n- For high-volume cargo")
-    if is_40: return ("40ft container:\n- 12.2m x 2.44m x 2.59m\n- ~67 CBM\n- Max payload ~30,400 kg")
-    if is_20: return ("20ft container:\n- 6.10m x 2.44m x 2.59m\n- ~33 CBM\n- Max payload ~28,000 kg")
-    return ("Common containers:\n- 20ft ~33 CBM (~28,000 kg)\n- 40ft ~67 CBM (~30,400 kg)\n- 40ft HC ~76 CBM\n- Reefer (20/40ft)\n- Open Top\n- Flat Rack")
+        return ("Reefer container:\n- Sizes: 20ft & 40ft\n- Temp: +2°C to –25°C\n- Use: food/pharma/perishables\n- Example 40ft: 12.2m × 2.44m × 2.59m (~67 CBM)")
+    if is_open_top:
+        return ("Open Top container (20ft/40ft):\n- Tarpaulin roof, same base dims\n- Top loading via crane/forklift\n- Ideal for tall cargo")
+    if is_flat_rack:
+        return ("Flat Rack container:\n- No sides/roof\n- For oversized cargo (vehicles, generators, heavy equipment)")
+    if is_40 and is_hc:
+        return ("40ft High Cube (HC):\n- 12.2m × 2.44m × 2.90m\n- ~76 CBM\n- For high-volume cargo")
+    if is_40:
+        return ("40ft container:\n- 12.2m × 2.44m × 2.59m\n- ~67 CBM\n- Max payload ~30,400 kg")
+    if is_20:
+        return ("20ft container:\n- 6.10m × 2.44m × 2.59m\n- ~33 CBM\n- Max payload ~28,000 kg")
+    return ("Common containers:\n- 20ft — ~33 CBM, max payload ~28,000 kg\n- 40ft — ~67 CBM, max payload ~30,400 kg\n- 40ft HC — ~76 CBM (taller)\n- Reefer — 20/40ft, +2°C to –25°C\n- Open Top — removable tarpaulin roof\n- Flat Rack — no sides/roof for oversized cargo")
 
 # ================== Retrieval & bullet safety ==================
 def _tokenize(s: str):
@@ -721,31 +736,46 @@ def _ctx_text_from_blocks(ctx_blocks, limit=4000):
     return "\n\n---\n\n".join(parts)
 
 def _needs_bullets(ans: str) -> bool:
-    if not ans or not ans.strip(): return True
+    """
+    True if answer looks like a stub: ends with 'summary:' / 'including:' / 'types:' etc. without bullets.
+    """
+    if not ans or not ans.strip():
+        return True
     s = ans.strip()
-    header_only = re.fullmatch(r"(?is)\s*([A-Za-z0-9 \-\(\)\/&]+:)\s*", s) is not None
-    says_summary = re.search(r"(?i)\b(summary|overview|specifications|specs|includes|the following)\b\s*:?\s*$", s) is not None
-    has_bullets = re.search(r"\n\s*(?:[-•*]|\d+\.)\s", s) is not None
-    return (header_only or says_summary) and not has_bullets
+    # bare heading only
+    if re.fullmatch(r"(?is)\s*[\w\s\-\(\)/&]+:\s*", s):
+        return True
+    # cue words at the end + no bullets yet
+    cue = re.search(r"(?is)\b(summary|overview|specifications|specs|including|includes|include|the following|as follows|list|types|services|features)\b\s*:?\s*$", s)
+    has_bullets = re.search(r"\n\s*(?:[-•*]|\d+\.)\s+", s) is not None
+    return bool(cue) and not has_bullets
 
 def _bulletize_with_llm(question: str, ctx_blocks: list, draft_heading: str = "") -> str:
     client = OpenAI()
     context = _ctx_text_from_blocks(ctx_blocks, limit=3500)
     heading = draft_heading.strip() if draft_heading else ""
     system = ("Rewrite the answer as concise bullet points using ONLY the provided context. "
-              "Return 5-12 bullets. No preamble, no closing line.")
+              "Return 5–12 bullets. No preamble, no closing line.")
     user = f"Question: {question}\n\nContext:\n{context}\n\n{('Heading: ' + heading) if heading else ''}\n\nWrite only bullet points:"
     resp = client.chat.completions.create(model=AI_MODEL, messages=[{"role":"system","content":system},{"role":"user","content":user}], temperature=0.1, max_tokens=220)
     return resp.choices[0].message.content.strip()
 
 def _maybe_force_bullets(question: str, ctx_blocks: list, ans: str) -> str:
-    if not _needs_bullets(ans): return ans
-    if re.search(r"(?i)fleet|trailer|truck", question):
+    if not _needs_bullets(ans):
+        return ans
+    qlow = (question or "").lower()
+    # deterministic topics first
+    if re.search(r"\bfleet|trailer|truck", qlow):
         forced = answer_fleet_intent(question, []);  return forced or ans
-    if re.search(r"(?i)21k|mussafah", question):
+    if re.search(r"\b21k|mussafah", qlow):
         forced = answer_21k_intent(question, []);    return forced or ans
+    if re.search(r"\bcontainer|20\s*ft|40\s*ft|high\s*cube|hc\b|reefer|open top|flat rack", qlow):
+        forced = answer_container_intent(question, []); return forced or ans
+    # bulletize using same context; if empty, still try general knowledge
     bulletized = _bulletize_with_llm(question, ctx_blocks, draft_heading=ans)
-    return bulletized or ans
+    if bulletized and not _needs_bullets(bulletized):
+        return bulletized
+    return _bulletize_with_llm(question, [], draft_heading=ans) or ans
 
 # ================== LLM answering ==================
 def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str:
@@ -757,9 +787,9 @@ def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str
         else: blocks.append(r["text"])
     context="\n\n---\n\n".join(blocks) if blocks else "No project context found."
 
-    system=("You are DSV's project assistant. Use conversation history to resolve follow-ups. "
-            "Answer from the project context. If you say 'summary', follow it with bullet points. "
-            "If the context does not contain the answer, say so briefly.")
+    system=("You are DSV’s project assistant. Use conversation history to resolve follow-ups. "
+            "Answer from the project context. If you write 'summary', 'including', 'types', 'services', etc., "
+            "you MUST follow with 5–12 bullet points. If the context doesn’t contain the answer, say so briefly.")
     msgs=[{"role":"system","content":system}]
     for m in history_msgs[-MAX_TURNS:]: msgs.append({"role": m["role"], "content": m["content"]})
     msgs.append({"role":"system","content": f"Project context:\n{context}"})
@@ -775,7 +805,8 @@ def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str
 def _llm_general_answer(question: str, history_msgs: list) -> str:
     client=OpenAI()
     system=("You are a helpful logistics assistant. Use the prior conversation to keep topic continuity. "
-            "If you say 'summary', follow it with bullet points. Answer accurately and concisely.")
+            "If you write 'summary', 'including', 'types', 'services', etc., follow with 5–12 bullet points. "
+            "Answer accurately and concisely.")
     msgs=[{"role":"system","content":system}]
     for m in history_msgs[-MAX_TURNS:]: msgs.append({"role": m["role"], "content": m["content"]})
     msgs.append({"role":"user","content":question})
@@ -794,7 +825,7 @@ def _is_nonanswer(text: str) -> bool:
 
 def _smart_answer(question: str, history_msgs: list) -> str:
     if not os.getenv("OPENAI_API_KEY"): return ("AI answers are disabled because OPENAI_API_KEY is not set.")
-    # Deterministic intents first (non-sticky)
+    # Deterministic intents first (containers can use anchor via function)
     pre = (answer_container_intent(question, history_msgs) or
            answer_fleet_intent(question, history_msgs) or
            answer_21k_intent(question, history_msgs) or
@@ -807,12 +838,12 @@ def _smart_answer(question: str, history_msgs: list) -> str:
     ctx=_retrieve_ctx(query_for_retrieval)
 
     if not _has_strong_ctx(ctx, question):
-        if STRICT_LOCAL: return "I do not have this in your saved files. (General knowledge disabled.)"
+        if STRICT_LOCAL: return "I don’t have this in your saved files."
         return _llm_general_answer(question, history_msgs)
 
     ans = _answer_with_ctx(question, ctx, history_msgs)
     if _is_nonanswer(ans):
-        if STRICT_LOCAL: return "I do not have this in your saved files. (General knowledge disabled.)"
+        if STRICT_LOCAL: return "I don’t have this in your saved files."
         return _llm_general_answer(question, history_msgs)
     return ans
 
@@ -825,7 +856,7 @@ def _fmt_num(x):
 
 def _format_bands(label, bands):
     if not bands: return f"{label}: (no data)"
-    rows = [f"- {_fmt_num(f)}-{_fmt_num(t)} CBM: {r:.2f} AED / CBM / DAY" for f,t,r in bands]
+    rows = [f"- {_fmt_num(f)}–{_fmt_num(t)} CBM: {r:.2f} AED / CBM / DAY" for f,t,r in bands]
     return f"{label}:\n" + "\n".join(rows)
 
 def _storage_rate_text_for_standard(kind):
@@ -833,11 +864,11 @@ def _storage_rate_text_for_standard(kind):
     try:
         lt = MATRIX[family]["lt1m"]; ge = MATRIX[family]["ge1m"]
     except Exception:
-        return "I could not load the standard storage bands from the matrix."
+        return "I couldn’t load the standard storage bands from the matrix."
     parts = [
         f"Standard {kind} storage rates (AED / CBM / DAY):",
         _format_bands("Period < 30 days", lt),
-        _format_bands("Period >= 30 days", ge),
+        _format_bands("Period ≥ 30 days", ge),
         "Note: band applies by CBM and duration."
     ]
     return "\n".join(parts)
@@ -847,12 +878,12 @@ def _storage_rate_text_for_specific(stype):
     if s == "chemicals ac": return "Chemicals AC storage: 3.50 AED / CBM / DAY."
     if s in ("chemicals non-ac (non-dg)", "chemicals non-ac"): return "Chemicals Non-AC (Non-DG) storage: 2.50 AED / CBM / DAY."
     if s == "chemicals non-ac (dg)": return "Chemicals Non-AC (DG) storage: 3.00 AED / CBM / DAY."
-    if "open yard – kizad" in s: return "Open Yard - KIZAD: 125 AED / SQM / YEAR (pro-rata)."
+    if "open yard - kizad" in s: return "Open Yard - KIZAD: 125 AED / SQM / YEAR (pro-rata)."
     if stype == "Open Yard – Mussafah (Open Yard)": return "Open Yard - Mussafah (Open Yard): 15 AED / SQM / MONTH (pro-rata)."
     if stype == "Open Yard – Mussafah (Open Yard Shed)": return "Open Yard - Mussafah (Open Yard Shed): 35 AED / SQM / MONTH (pro-rata)."
     if stype == "Open Yard – Mussafah (Jumbo Bag)": return "Open Yard - Mussafah (Jumbo Bag): 19 AED / BAG / MONTH (pro-rata)."
-    if s.startswith("rms — premium"): return "RMS - Premium AC archiving: 5.00 AED / BOX / MONTH."
-    if s.startswith("rms — normal"): return "RMS - Normal AC archiving: 3.00 AED / BOX / MONTH."
+    if s.startswith("rms - premium"): return "RMS - Premium AC archiving: 5.00 AED / BOX / MONTH."
+    if s.startswith("rms - normal"):  return "RMS - Normal AC archiving: 3.00 AED / BOX / MONTH."
     return ""
 
 def _guess_storage_kind_from_text(text, history_anchor=""):
@@ -862,13 +893,13 @@ def _guess_storage_kind_from_text(text, history_anchor=""):
         if "dg" in s: return "Chemicals Non-AC (DG)"
         return "Chemicals Non-AC (Non-DG)"
     if "open yard" in s or "kizad" in s or "mussafah yard" in s:
-        if "kizad" in s: return "Open Yard – KIZAD"
+        if "kizad" in s: return "Open Yard - KIZAD"
         if "shed" in s:  return "Open Yard – Mussafah (Open Yard Shed)"
         if "jumbo" in s: return "Open Yard – Mussafah (Jumbo Bag)"
         return "Open Yard – Mussafah (Open Yard)"
     if "rms" in s or "record management" in s or "archiv" in s:
-        if "premium" in s: return "RMS — Premium FM200 Archiving AC Facility"
-        return "RMS — Normal AC Facility"
+        if "premium" in s: return "RMS - Premium FM200 Archiving AC Facility"
+        return "RMS - Normal AC Facility"
     if re.search(r"\b(ac|a\.c\.|air ?cond)\b", s): return "AC"
     if re.search(r"\bnon[- ]?ac\b", s) or "dry" in s: return "Non-AC"
     if "open shed" in s: return "Open Shed"
