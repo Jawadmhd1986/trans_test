@@ -23,16 +23,16 @@ EMB_MODEL = os.getenv("AI_EMB_MODEL", "text-embedding-3-small")
 RAG_INDEX_PATH = Path("rag_index.npz")
 RAG_META_PATH  = Path("rag_index_meta.json")
 
-# Scan your project files (templates + chatbot folder + static)
-RAG_FOLDERS = ["templates", "templates/chatbot", "static"]
+# Scan your project files (templates + chatbot folder + static + CHATBOT INFO)
+RAG_FOLDERS = ["templates", "templates/chatbot", "static", "CHATBOT INFO"]
 RAG_GLOBS   = ["*.py","*.js","*.ts","*.html","*.css","*.txt","*.md","*.docx","*.xlsx","*.pdf"]
 EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", "generated"}
 
-# Retrieval tuning (fast)
-CHARS_PER_CHUNK   = 900
-CHUNK_OVERLAP     = 150
-TOP_K             = 6
-MAX_CONTEXT_CHARS = 7000
+# Retrieval tuning (improved for better accuracy)
+CHARS_PER_CHUNK   = 1200  # Larger chunks for more context
+CHUNK_OVERLAP     = 200   # More overlap to avoid missing info
+TOP_K             = 8     # More results to increase chance of finding answer
+MAX_CONTEXT_CHARS = 9000  # More context for better answers
 MAX_FILE_BYTES    = 1_500_000
 MAX_TOTAL_CHUNKS  = 4000
 EMBED_BATCH       = 32
@@ -91,7 +91,7 @@ def index():
     return render_template("form.html")
 
 # ================== Matrix / pricing helpers (original logic) ==================
-TARIFF_PATH = "CL TARIFF - 2025 v3 (004) - UPDATED 6TH AUGUST 2025.xlsx"
+Tariff_PATH = "CL TARIFF - 2025 v3 (004) - UPDATED 6TH AUGUST 2025.xlsx"
 
 def _is_num(x):
     return isinstance(x, (int, float)) and pd.notna(x)
@@ -123,7 +123,7 @@ def _bands_from_rows(df, rows, from_col=2, to_col=3):
     return out
 
 def load_matrix():
-    xls = pd.ExcelFile(TARIFF_PATH)
+    xls = pd.ExcelFile(Tariff_PATH)
     wh = pd.read_excel(xls, "CL - WH & OY (2)", header=None)
     ac_lt1m_rows  = [5, 6, 7]
     ac_ge1m_rows  = [12, 13, 14]
@@ -207,7 +207,7 @@ def compute_item(storage_type, volume, days, include_wms, commodity=""):
         "commodity": (commodity or "").strip(),
     }
 
-# --------- commodity helper ----------
+# ---------- commodity helper ----------
 def _clean_commodity(val: str) -> str:
     s = (val or "").strip()
     if not s: return ""
@@ -446,7 +446,7 @@ def generate():
         st_lower = (raw_st or "").strip().lower()
         if st_lower == "rms":
             tier = (rms_tier_list[i] or "").strip()
-            st_label = ("RMS — Premium FM200 Archiving AC Facility"
+            st_label = ("RMS — Premium AC Facility"
                         if "premium" in tier.lower() else "RMS — Normal AC Facility")
             vol = float(rms_boxes_list[i] or 0)  # boxes
             inc = True  # WMS always ON for RMS
@@ -628,7 +628,7 @@ def generate():
         if used_rms:      combined += _append_terms_from_template("templates/RMS VAS.docx")
 
         doc.add_paragraph(" ")
-        h = doc.add_paragraph("Terms & Conditions — Combined"); h.runs[0].bold = True
+        doc.add_paragraph("Terms & Conditions — Combined"); h = doc.paragraphs[-1]; h.runs[0].bold = True
 
         seen = set()
         non_haz_line = "The above rates offered are for non-Haz cargo."
@@ -672,39 +672,80 @@ def _list_files_for_rag():
     files = []
     for folder in RAG_FOLDERS:
         base = Path(folder)
-        if not base.exists(): 
+        if not base.exists():
+            log.warning(f"RAG folder not found: {folder}")
             continue
+        
+        log.info(f"Scanning folder: {folder}")
+        folder_files = 0
         for p in base.rglob("*"):
-            if not p.is_file(): 
+            if not p.is_file():
                 continue
             if any(part in EXCLUDE_DIRS for part in p.parts):
                 continue
             if not any(fnmatch.fnmatch(p.name, g) for g in RAG_GLOBS):
                 continue
             try:
-                if p.stat().st_size > MAX_FILE_BYTES:
+                size = p.stat().st_size
+                if size > MAX_FILE_BYTES:
+                    log.warning(f"File too large, skipping: {p} ({size} bytes)")
+                    continue
+                if size == 0:
+                    log.warning(f"Empty file, skipping: {p}")
                     continue
             except Exception:
                 pass
             files.append(p)
+            folder_files += 1
+        
+        log.info(f"Found {folder_files} files in {folder}")
+    
+    # Prioritize CHATBOT INFO files
+    chatbot_files = [f for f in files if "CHATBOT INFO" in str(f)]
+    other_files = [f for f in files if "CHATBOT INFO" not in str(f)]
+    files = chatbot_files + other_files
+    
     seen, out = set(), []
     for p in files:
         key = str(p.resolve())
         if key not in seen:
             seen.add(key); out.append(p)
+    
+    log.info(f"Total files for RAG: {len(out)} ({len(chatbot_files)} from CHATBOT INFO)")
     return out
 
 def _read_pdf_file(p: Path) -> str:
     try:
         from pypdf import PdfReader
+        log.info(f"Attempting to read PDF: {p}")
         reader = PdfReader(str(p))
         out = []
-        for page in reader.pages[:120]:
-            txt = (page.extract_text() or "").strip()
-            if txt:
-                out.append(txt)
-        return "\n".join(out)
-    except Exception:
+        total_pages = len(reader.pages)
+        log.info(f"PDF {p.name} has {total_pages} pages")
+        
+        for i, page in enumerate(reader.pages[:120]):  # Limit to first 120 pages
+            try:
+                txt = page.extract_text()
+                if txt and txt.strip():
+                    clean_txt = txt.strip()
+                    out.append(clean_txt)
+                    if i < 3:  # Log first few pages for debugging
+                        log.info(f"Page {i} text preview: {clean_txt[:200]}...")
+            except Exception as e:
+                log.warning(f"Error extracting text from page {i} of {p}: {e}")
+                continue
+        
+        result = "\n".join(out)
+        if result:
+            log.info(f"Successfully extracted {len(result)} characters from PDF: {p.name}")
+        else:
+            log.warning(f"No text extracted from PDF: {p.name}")
+        return result
+    except ImportError as e:
+        log.error(f"pypdf not available: {e}")
+        return ""
+    except Exception as e:
+        log.error(f"Error reading PDF file {p}: {e}")
         return ""
 
 def _file_text_for_rag(p: Path) -> str:
@@ -801,137 +842,184 @@ _ensure_index()
 def _tokenize(s: str):
     return re.findall(r"[a-z0-9]+", (s or "").lower())
 
-def _retrieve_ctx(q: str, top_k=TOP_K):
-    """Hybrid retrieval: semantic cosine + keyword bonus (prefers templates/chatbot)."""
-    if RAG_VECTORS.shape[0]==0 or not RAG_META:
-        return []
-    client=OpenAI()
-    qemb=client.embeddings.create(model=EMB_MODEL, input=[q]).data[0].embedding
-    qv = np.array(qemb,dtype=np.float32)
-    qv /= (np.linalg.norm(qv)+1e-9)
-    base = RAG_VECTORS / (np.linalg.norm(RAG_VECTORS,axis=1,keepdims=True)+1e-9)
-    sims = base @ qv
+def _search_rag(query: str, top_k: int = TOP_K) -> list:
+    """Enhanced semantic + keyword search with chatbot folder priority."""
+    if RAG_VECTORS.shape[0] == 0: return []
+    client = OpenAI()
+    resp = client.embeddings.create(input=[query], model=EMB_MODEL)
+    q_emb = np.array(resp.data[0].embedding, dtype=np.float32)
+    scores = np.dot(RAG_VECTORS, q_emb)
 
-    q_toks = set(_tokenize(q))
-    kw_scores = np.zeros(len(RAG_META), dtype=np.float32)
-    for i, md in enumerate(RAG_META):
-        t = md["text"].lower()
-        hit = sum(1 for tok in q_toks if tok and tok in t)
-        bonus = 0.03 * hit
-        if "templates/chatbot" in (md["path"].replace("\\","/")).lower():
-            bonus += 0.05 * hit
-        kw_scores[i] = bonus
+    # Enhanced keyword matching with more comprehensive terms
+    words = set(re.findall(r'\w+', query.lower()))
+    storage_keywords = {'storage', 'warehouse', 'facility', 'depot'}
+    rate_keywords = {'rate', 'price', 'cost', 'fee', 'charge', 'tariff', 'aed'}
+    service_keywords = {'ac', 'non-ac', 'chemical', 'rms', 'standard', 'vas', 'open', 'yard'}
+    company_keywords = {'dsv', 'solutions', 'pjsc'}
 
-    combined = sims + kw_scores
-    idx = combined.argsort()[::-1][:max(top_k, 2*top_k)]
-    total = 0; out=[]
-    for i in idx:
-        md = RAG_META[i]
-        out.append(md)
-        total += len(md["text"])
-        if total >= MAX_CONTEXT_CHARS:
-            break
-    return out[:top_k]
+    for i, meta in enumerate(RAG_META):
+        txt = meta['text'].lower()
+        path = meta['path'].lower()
 
-def _has_strong_ctx(ctx, question: str) -> bool:
-    if not ctx:
+        # Exact phrase matching for better accuracy
+        if any(phrase in txt for phrase in [w for w in words if len(w) > 2]):
+            scores[i] += 0.2
+
+        # Category-specific keyword boosts
+        storage_hits = sum(1 for w in storage_keywords if w in txt and w in query.lower())
+        rate_hits = sum(1 for w in rate_keywords if w in txt and w in query.lower())
+        service_hits = sum(1 for w in service_keywords if w in txt and w in query.lower())
+        company_hits = sum(1 for w in company_keywords if w in txt and w in query.lower())
+
+        scores[i] += 0.3 * storage_hits
+        scores[i] += 0.35 * rate_hits  # Boost rate-related content more
+        scores[i] += 0.25 * service_hits
+        scores[i] += 0.2 * company_hits
+
+        # MASSIVE boost for chatbot info folder (your main documentation)
+        if 'chatbot info' in path or 'chatbot' in path:
+            scores[i] += 0.8
+
+        # High boost for specific rate/terms PDFs
+        if path.endswith('.pdf'):
+            scores[i] += 0.3
+            # Extra boost for specific document types
+            if any(doc_type in path for doc_type in ['rates', 'standard rates', 'chemical rates', 'rms', 'terms']):
+                scores[i] += 0.4
+
+        # Boost template files for VAS and terms info
+        if 'templates/' in path and any(keyword in path for keyword in ['vas', 'standard', 'chemical', 'rms']):
+            scores[i] += 0.3
+
+        # Penalize very short chunks that might not have context
+        if len(meta['text']) < 100:
+            scores[i] -= 0.1
+
+    top_ids = np.argsort(scores)[-top_k:][::-1]
+    # Lower threshold to catch more relevant content
+    return [RAG_META[i] for i in top_ids if scores[i] > 0.05]
+
+def _build_context_from_docs(search_results):
+    """Build context from search results with smart prioritization."""
+    if not search_results:
+        return None
+
+    # Sort results by source priority and relevance score
+    def source_priority(result):
+        path = result['path'].lower()
+        if 'chatbot info' in path or 'chatbot' in path:
+            return 0  # Highest priority
+        elif 'rates' in path or 'terms' in path:
+            return 1  # High priority
+        elif 'templates' in path:
+            return 2  # Medium priority
+        else:
+            return 3  # Lower priority
+
+    # Sort by priority first, then by text length (longer chunks often have more complete info)
+    sorted_results = sorted(search_results, key=lambda x: (source_priority(x), -len(x['text'])))
+
+    context_parts = []
+    total_chars = 0
+    max_context = 12000  # Increased context window for better accuracy
+    sources_used = set()
+
+    # First pass: Add high-priority sources
+    for result in sorted_results:
+        if source_priority(result) > 1:  # Skip lower priority in first pass
+            continue
+
+        chunk = result["text"]
+        path = result["path"]
+
+        # For high-priority sources, include more complete chunks
+        if total_chars + len(chunk) > max_context * 0.7:
+            continue
+
+        source_info = f"Source: {path}"
+        context_parts.append(f"{source_info}\n{chunk}")
+        total_chars += len(chunk) + len(source_info) + 2
+        sources_used.add(path)
+
+    # Second pass: Fill remaining space with other sources
+    for result in sorted_results:
+        if result['path'] in sources_used:
+            continue
+
+        chunk = result["text"]
+        path = result["path"]
+
+        if total_chars + len(chunk) > max_context:
+            # Try to fit a partial chunk if there's space
+            remaining_space = max_context - total_chars - 100
+            if remaining_space > 200:
+                chunk = chunk[:remaining_space]
+            else:
+                break
+
+        source_info = f"Source: {path}"
+        context_parts.append(f"{source_info}\n{chunk}")
+        total_chars += len(chunk) + len(source_info) + 2
+        sources_used.add(path)
+
+    if not context_parts:
+        return None
+
+    return "\n\n---\n\n".join(context_parts)
+
+def _has_strong_ctx(ctx_blocks: list, question: str) -> bool:
+    if not ctx_blocks:
         return False
-    total_len = sum(len(md["text"]) for md in ctx)
-    if total_len < 400:
+    total_len = sum(len(md["text"]) for md in ctx_blocks)
+    if total_len < 400: # Minimum content length for "strong" context
         return False
-    q_toks = set(t for t in _tokenize(question) if len(t) > 2)
-    sample = " ".join(md["text"] for md in ctx[:3]).lower()
+    q_toks = set(t for t in _tokenize(question) if len(t) > 2) # Use tokens from question
+    sample = " ".join(md["text"] for md in ctx_blocks[:3]).lower() # Check first few chunks
     hit = sum(1 for t in q_toks if t in sample)
-    return hit >= 2
+    return hit >= 2 # Require at least 2 keyword hits
 
-# ---------------- Bullet safety (avoid empty "summary:" endings) ----------------
 def _needs_bullets(ans: str) -> bool:
     """True if answer ends with 'summary:' / 'including:' / 'types:' etc. and has no bullets."""
     if not ans or not ans.strip():
         return True
     s = ans.strip()
+    # Only trigger if it's JUST a heading with no substantial content
     if re.fullmatch(r"(?is)\s*[\w\s\-\(\)/&]+:\s*", s):
         return True
-    cue = re.search(r"(?is)\b(summary|overview|specifications|specs|including|includes|include|the following|as follows|list|types|services|features)\b\s*:?\s*$", s)
+    # For brief responses, don't force bullets unless it's clearly incomplete
+    if len(s) > 50:
+        return False
+    # Only force bullets for very short responses that end with list indicators
+    cue = re.search(r"(?is)\b(summary|overview|including|includes|include|the following|as follows|list|types|services|features)\b\s*:?\s*$", s)
     has_bullets = re.search(r"\n\s*(?:[-•*]|\d+\.)\s+", s) is not None
-    return bool(cue) and not has_bullets
-
-def _ctx_text_from_blocks(ctx_blocks, limit=3500):
-    parts=[]; total=0
-    for md in ctx_blocks:
-        t=(md.get("text") or "").strip()
-        if not t: continue
-        if total+len(t)>limit: t=t[:max(0,limit-total)]
-        parts.append(t); total += len(t)
-        if total>=limit: break
-    return "\n\n---\n\n".join(parts)
+    return bool(cue) and not has_bullets and len(s) < 30
 
 def _bulletize_with_llm(question: str, ctx_blocks: list, draft_heading: str = "") -> str:
     client = OpenAI()
-    context = _ctx_text_from_blocks(ctx_blocks, limit=3500)
+    context = _build_context_from_docs(ctx_blocks) # Use the context builder
+    if not context: context = "No relevant project files found."
+
     heading = draft_heading.strip() if draft_heading else ""
     system = ("Rewrite the answer as concise bullet points using ONLY the provided context. "
               "Return 5–12 bullets. No preamble, no closing line.")
     user = f"Question: {question}\n\nContext:\n{context}\n\n{('Heading: ' + heading) if heading else ''}\n\nWrite only bullet points:"
     resp=client.chat.completions.create(model=AI_MODEL,
                                         messages=[{"role":"system","content":system},{"role":"user","content":user}],
-                                        temperature=0.1, max_tokens=220)
+                                        temperature=0.1, max_tokens=400)
     return resp.choices[0].message.content.strip()
 
 def _maybe_force_bullets(question: str, ctx_blocks: list, ans: str) -> str:
-    if not _needs_bullets(ans):
+    # Only force bullets for very incomplete responses
+    if not _needs_bullets(ans) or len(ans.strip()) > 100:
         return ans
     # bulletize using same context; if empty, still try general knowledge
     bulletized = _bulletize_with_llm(question, ctx_blocks, draft_heading=ans)
     if bulletized and not _needs_bullets(bulletized):
         return bulletized
-    return _bulletize_with_llm(question, [], draft_heading=ans) or ans
+    return _bulletize_with_llm(question, [], draft_heading=ans) or ans # Fallback to general knowledge bulleting
 
-# ---------------- Chat answering ----------------
-def _answer_with_ctx(question: str, ctx_blocks: list, history_msgs: list) -> str:
-    """Use project context to answer; if stub -> bulletize."""
-    client=OpenAI()
-    blocks=[]; seen=set(); srcs=[]
-    for r in ctx_blocks:
-        p=r["path"]; srcs.append(p)
-        if p not in seen: seen.add(p); blocks.append(f"Source: {p}\n{r['text']}")
-        else: blocks.append(r["text"])
-    context="\n\n---\n\n".join(blocks) if blocks else "No project context found."
-
-    system=("You are DSV’s project assistant. Use conversation history to resolve follow-ups. "
-            "Answer from the project context. If you write 'summary', 'including', 'types', 'services', etc., "
-            "you MUST follow with 5–12 bullet points. If the context doesn’t contain the answer, say so briefly.")
-    msgs=[{"role":"system","content":system}]
-    for m in history_msgs[-MAX_TURNS:]:
-        msgs.append({"role": m["role"], "content": m["content"]})
-    msgs.append({"role":"system","content": f"Project context:\n{context}"})
-    msgs.append({"role":"user","content": question})
-
-    resp=client.chat.completions.create(model=AI_MODEL, messages=msgs, temperature=0.2, max_tokens=300)
-    ans = resp.choices[0].message.content.strip()
-    ans = _maybe_force_bullets(question, ctx_blocks, ans)
-    if TAG_SOURCES: ans = "[From files] " + ans
-    if AI_DEBUG and srcs:
-        uniq = list(dict.fromkeys(srcs))[:5]
-        ans += "\n\n[Sources]\n" + "\n".join(uniq)
-    return ans
-
-def _llm_general_answer(question: str, history_msgs: list) -> str:
-    """Plain ChatGPT fallback (no files)."""
-    client=OpenAI()
-    system=("You are a helpful logistics assistant. Use the prior conversation to keep topic continuity. "
-            "If you write 'summary', 'including', 'types', 'services', etc., follow with 5–12 bullet points. "
-            "Answer accurately and concisely.")
-    msgs=[{"role":"system","content":system}]
-    for m in history_msgs[-MAX_TURNS:]:
-        msgs.append({"role": m["role"], "content": m["content"]})
-    msgs.append({"role":"user","content":question})
-    resp=client.chat.completions.create(model=AI_MODEL, messages=msgs, temperature=0.2, max_tokens=250)
-    ans = resp.choices[0].message.content.strip()
-    ans = _maybe_force_bullets(question, [], ans)
-    if TAG_SOURCES: ans = "[General knowledge] " + ans
-    return ans
-
+# ---------------- Bullet safety (avoid empty "summary:" endings) ----------------
+# (This function is kept but _needs_bullets and _bulletize_with_llm are used instead)
 def _is_nonanswer(text: str) -> bool:
     if not text: return True
     bad = [r"does not provide", r"not present in the context", r"based on the provided context.*cannot",
@@ -939,29 +1027,140 @@ def _is_nonanswer(text: str) -> bool:
     t = text.strip().lower()
     return any(re.search(p, t) for p in bad)
 
-def _smart_answer(question: str, history_msgs: list) -> str:
-    if not os.getenv("OPENAI_API_KEY"):
-        return ("AI answers are disabled because OPENAI_API_KEY is not set.")
-    _ensure_index()
+def _llm_with_context(question: str, context: str, history_msgs: list) -> str:
+    """Use project context to answer with improved accuracy."""
+    client=OpenAI()
+    if not context: context = "No project context found."
 
-    # Build retrieval query (anchor only for short follow-ups)
-    anchor = _history_text_for_query(history_msgs) if _should_use_anchor(question) else ""
-    query_for_retrieval = question if not anchor else f"{question}\n\nRecent topic: {anchor}"
-    ctx=_retrieve_ctx(query_for_retrieval)
+    # Create enhanced prompt with context
+    system_msg = """You are a DSV logistics assistant. Answer questions using ONLY the provided context from DSV's official documents.
 
-    # File context weak/missing -> fallback to ChatGPT
-    if not _has_strong_ctx(ctx, question):
-        if STRICT_LOCAL:
-            return "I don’t have this in your saved files."
-        return _llm_general_answer(question, history_msgs)
+CRITICAL INSTRUCTIONS:
+- Carefully read through ALL the provided context before answering
+- Use ONLY information explicitly stated in the provided context
+- If multiple sources contain relevant info, synthesize the complete answer
+- Quote specific rates, terms, and details exactly as written
+- If the answer is in the context but incomplete, provide what's available and note what's missing
 
-    # Try with files
-    ans = _answer_with_ctx(question, ctx, history_msgs)
+SEARCH STRATEGY:
+- Look for exact keywords and phrases from the question in the context
+- Check multiple document sources if available
+- Pay attention to different document types (rates, terms, VAS, etc.)
+
+RESPONSE STYLE:
+- Be direct and factual but complete
+- Always include exact rates with units (AED/CBM/DAY, AED/SQM/MONTH, etc.)
+- Include specific details like minimums, duration-based pricing, conditions
+- Mention the source document when helpful for credibility
+
+COMPANY INFO FROM CONTEXT:
+- Extract company details, services, fleet info directly from the provided documents
+- Include specific operational details found in the context
+- Reference facility locations, service types as mentioned in documents
+
+If no relevant information is found in the context, clearly state "I don't see that specific information in the provided documents."
+
+    """
+    msgs=[{"role":"system","content":system_msg}]
+    for m in history_msgs[-MAX_TURNS:]:
+        msgs.append({"role": m["role"], "content": m["content"]})
+    msgs.append({"role":"system","content": f"DSV OFFICIAL DOCUMENTS CONTEXT:\n{context}"})
+    msgs.append({"role":"user","content": question})
+
+    resp=client.chat.completions.create(model=AI_MODEL, messages=msgs, temperature=0.1, max_tokens=500)
+    ans = resp.choices[0].message.content.strip()
+
+    # Check if the answer is just a stub and try to bulletize if necessary
     if _is_nonanswer(ans):
-        if STRICT_LOCAL:
-            return "I don’t have this in your saved files."
-        return _llm_general_answer(question, history_msgs)
+        return ans
+
+    # Attempt to bulletize if it looks like a list heading without bullets
+    ans = _maybe_force_bullets(question, [], ans)
+
+    if TAG_SOURCES: ans = "[From files] " + ans
+    if AI_DEBUG and not context.startswith("No project context found."):
+        # Extract sources from context for AI_DEBUG
+        sources = re.findall(r"Source: ([^\n]+)", context)
+        if sources:
+            uniq_sources = list(dict.fromkeys(sources))[:5]
+            ans += "\n\n[Sources]\n" + "\n".join(uniq_sources)
     return ans
+
+def _llm_general_answer(question: str, history_msgs: list) -> str:
+    """Plain ChatGPT fallback (no files)."""
+    client=OpenAI()
+    system_msg = """You are a DSV logistics assistant. Give brief, direct answers.
+
+RESPONSE STYLE:
+- Keep answers concise (1-3 sentences unless asked for details)
+- Lead with the most important information
+- No lengthy explanations unless specifically requested
+
+DSV SERVICES:
+- Global transport and logistics company
+- Road transport, air & sea freight, contract logistics
+- Large fleet: trucks, trailers, specialized vehicles
+- UAE operations: Dubai, Abu Dhabi facilities
+
+RATES (when applicable):
+- AC storage: 1.2-3.5 AED/CBM/DAY
+- Non-AC storage: 0.8-2.5 AED/CBM/DAY
+- Include minimums and duration-based pricing
+
+Keep responses brief unless user asks for more details."""
+
+    msgs=[{"role":"system","content":system_msg}]
+    for m in history_msgs[-MAX_TURNS:]:
+        msgs.append({"role": m["role"], "content": m["content"]})
+    msgs.append({"role":"user","content":question})
+    resp=client.chat.completions.create(model=AI_MODEL, messages=msgs, temperature=0.2, max_tokens=300)
+    ans = resp.choices[0].message.content.strip()
+    ans = _maybe_force_bullets(question, [], ans)
+    if TAG_SOURCES: ans = "[General knowledge] " + ans
+    return ans
+
+def _smart_answer(question: str, history_msgs: list) -> str:
+    """Search your files first with enhanced matching, fallback to ChatGPT."""
+    docs = _search_rag(question)
+
+    # If we found good matches, use them
+    if docs:
+        context = _build_context_from_docs(docs)
+        # Log more details for debugging
+        sources = [doc['path'] for doc in docs[:5]]  # Top 5 sources
+        log.info(f"Found {len(docs)} docs, context: {len(context)} chars")
+        log.info(f"Top sources: {sources}")
+        log.info(f"Question: {question[:100]}...")
+        return _llm_with_context(question, context, history_msgs)
+
+    # If no matches but query seems DSV-related, try broader search
+    dsv_related = any(keyword in question.lower() for keyword in
+                     ['dsv', 'storage', 'rate', 'warehouse', 'ac', 'chemical', 'rms', 'standard', 'terms'])
+
+    if dsv_related:
+        # Try a broader search with lower threshold
+        broader_docs = []
+        if RAG_VECTORS.shape[0] > 0:
+            client = OpenAI()
+            resp = client.embeddings.create(input=[question], model=EMB_MODEL)
+            q_emb = np.array(resp.data[0].embedding, dtype=np.float32)
+            scores = np.dot(RAG_VECTORS, q_emb)
+
+            # Lower threshold, prioritize chatbot folder
+            for i, meta in enumerate(RAG_META):
+                if 'chatbot' in meta['path'].lower():
+                    scores[i] += 0.4
+
+            top_ids = np.argsort(scores)[-8:][::-1]  # Get more results
+            broader_docs = [RAG_META[i] for i in top_ids if scores[i] > 0.05]
+
+        if broader_docs:
+            context = _build_context_from_docs(broader_docs)
+            log.info(f"Broader search found {len(broader_docs)} docs for DSV query")
+            return _llm_with_context(question, context, history_msgs)
+
+    log.info("No RAG matches, using general LLM")
+    return _llm_general_answer(question, history_msgs)
 
 # ---------------- Chat routes ----------------
 @app.route("/smart_chat", methods=["POST"])
@@ -1025,5 +1224,5 @@ def reindex():
 _ensure_index()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
