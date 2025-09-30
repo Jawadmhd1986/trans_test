@@ -1,1228 +1,2518 @@
-# app.py  — full version (files-first, fast RAG, PDF support, ChatGPT fallback, original generate logic kept)
-
-from flask import Flask, render_template, request, send_file, jsonify, make_response
-from docx import Document
-from docx.shared import Pt
-from docx.enum.text import WD_LINE_SPACING
-import os, re, logging, json, hashlib, fnmatch, uuid
-from datetime import datetime
-from pathlib import Path
-import numpy as np
+from flask import Flask, render_template, request, jsonify, send_file, redirect, session, after_this_request
 import pandas as pd
-from copy import deepcopy
-from openai import OpenAI
+import os
+from datetime import datetime, timedelta
+from filelock import FileLock
+from openpyxl import Workbook, load_workbook
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Boolean, Text, UniqueConstraint, Index, func, or_
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from werkzeug.security import generate_password_hash, check_password_hash
+import json
+import hashlib
+import re
+import pytz
 
-# ---------------- Logging ----------------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("dsv-app")
-
-# ---------------- AI / RAG config ----------------
-AI_MODEL = os.getenv("AI_CHAT_MODEL", "gpt-4o-mini")
-EMB_MODEL = os.getenv("AI_EMB_MODEL", "text-embedding-3-small")
-
-RAG_INDEX_PATH = Path("rag_index.npz")
-RAG_META_PATH  = Path("rag_index_meta.json")
-
-# Scan your project files (templates + chatbot folder + static + CHATBOT INFO)
-RAG_FOLDERS = ["templates", "templates/chatbot", "static", "CHATBOT INFO"]
-RAG_GLOBS   = ["*.py","*.js","*.ts","*.html","*.css","*.txt","*.md","*.docx","*.xlsx","*.pdf"]
-EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", "generated"}
-
-# Retrieval tuning (improved for better accuracy)
-CHARS_PER_CHUNK   = 1200  # Larger chunks for more context
-CHUNK_OVERLAP     = 200   # More overlap to avoid missing info
-TOP_K             = 8     # More results to increase chance of finding answer
-MAX_CONTEXT_CHARS = 9000  # More context for better answers
-MAX_FILE_BYTES    = 1_500_000
-MAX_TOTAL_CHUNKS  = 4000
-EMBED_BATCH       = 32
-
-# Behavior toggles
-AI_DEBUG     = os.getenv("AI_DEBUG", "0") == "1"      # add [Sources]
-TAG_SOURCES  = os.getenv("TAG_SOURCES", "0") == "1"   # prefix replies with source tag
-STRICT_LOCAL = os.getenv("STRICT_LOCAL", "0") == "1"  # 0 = allow ChatGPT fallback
-
-# Pre-init index globals
-RAG_VECTORS = np.zeros((0, 1536), dtype=np.float32)
-RAG_META    = []
-
-# ---------------- Conversation memory (per user via cookie) ----------------
-CONV = {}      # { cid: [ {"role":"user"|"assistant", "content":"..."} , ... ] }
-MAX_TURNS = 10
-
-def _get_cid():
-    cid = request.cookies.get("cid")
-    if not cid:
-        cid = uuid.uuid4().hex
-    return cid
-
-def _get_history(cid):
-    return CONV.get(cid, [])
-
-def _append_history(cid, role, content):
-    hist = CONV.get(cid, [])
-    hist.append({"role": role, "content": (content or "").strip()})
-    if len(hist) > MAX_TURNS:
-        hist = hist[-MAX_TURNS:]
-    CONV[cid] = hist
-
-def _history_text_for_query(hist, max_chars=600):
-    """Compact anchor from recent turns so short follow-ups inherit the topic."""
-    if not hist:
-        return ""
-    last_user = [m.get("content","") for m in hist if m.get("role") == "user"][-3:]
-    last_asst = [m.get("content","") for m in hist if m.get("role") == "assistant"][-1:]
-    blob = " | ".join(last_user + last_asst)
-    return blob[-max_chars:]
-
-def _should_use_anchor(question: str) -> bool:
-    """Use recent context only for short follow-ups (avoid sticky topics)."""
-    s = (question or "").strip().lower()
-    if len(s.split()) <= 5: return True
-    if re.search(r"\b(how many|how much|what rate|which one|and|it|them|that|those|list|types|services)\b", s):
-        return True
-    return False
-
-# ---------------- Flask ----------------
 app = Flask(__name__)
+app.secret_key = os.environ.get("APP_SECRET", "dsv-stock-count-secret-key-2025")
 
-@app.route("/")
-def index():
-    return render_template("form.html")
+# --- Timezone Configuration ---
+ABU_DHABI_TZ = pytz.timezone("Asia/Dubai")
 
-# ================== Matrix / pricing helpers (original logic) ==================
-Tariff_PATH = "CL TARIFF - 2025 v3 (004) - UPDATED 6TH AUGUST 2025.xlsx"
+def abu_dhabi_now():
+    """Returns the current time in Abu Dhabi timezone."""
+    return datetime.now(ABU_DHABI_TZ)
 
-def _is_num(x):
-    return isinstance(x, (int, float)) and pd.notna(x)
+def _no_cache(resp):
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+app.config.update(
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+)
 
-def _daily_rate_from_row(df, r, from_col=2, to_col=3):
-    candidates, fallback = [], []
-    for c in range(df.shape[1]):
-        if c in (from_col, to_col):
-            continue
-        v = df.iat[r, c]
-        if _is_num(v):
-            v = float(v)
-            if 1.2 <= v <= 10.0:
-                candidates.append(v)
-            elif v > 0:
-                fallback.append(v)
-    if candidates:
-        return min(candidates)
-    return min(fallback) if fallback else 0.0
+SESSION_TL_KEY = "tl_session"
 
-def _bands_from_rows(df, rows, from_col=2, to_col=3):
-    out = []
-    for r in rows:
-        f = df.iat[r, from_col]
-        t = df.iat[r, to_col]
-        if isinstance(t, str) and "above" in t.lower():
-            t = float("inf")
-        out.append((float(f), float(t), float(_daily_rate_from_row(df, r, from_col, to_col))))
-    return out
+def set_tl_session(tl_name, tl_display_name):
+    session[SESSION_TL_KEY] = {"name": tl_name, "display_name": tl_display_name, "ts": abu_dhabi_now().isoformat()}
 
-def load_matrix():
-    xls = pd.ExcelFile(Tariff_PATH)
-    wh = pd.read_excel(xls, "CL - WH & OY (2)", header=None)
-    ac_lt1m_rows  = [5, 6, 7]
-    ac_ge1m_rows  = [12, 13, 14]
-    dry_lt1m_rows = [22, 23, 24]
-    dry_ge1m_rows = [29, 30, 31]
-    return {
-        "ac":  {"lt1m": _bands_from_rows(wh, ac_lt1m_rows),  "ge1m": _bands_from_rows(wh, ac_ge1m_rows)},
-        "dry": {"lt1m": _bands_from_rows(wh, dry_lt1m_rows), "ge1m": _bands_from_rows(wh, dry_ge1m_rows)},
-    }
+def require_tl():
+    return bool(session.get(SESSION_TL_KEY))
 
-MATRIX = load_matrix()
+# Database setup
+engine = create_engine('sqlite:///line_count.db', echo=False)
+Base = declarative_base()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-def _pick_rate(bands, volume):
-    for f, t, r in bands:
-        if f <= volume <= t:
-            return r
-    return bands[-1][2] if bands else 0.0
+# Constants
+LOCATIONS = ["KIZAD", "JEBEL_ALI"]
+WAREHOUSES = {
+    "KIZAD": ["KIZAD-W1"],
+    "JEBEL_ALI": ["JA-W1", "JA-W2", "JA-W3"]
+}
 
-# ---- pricing for one item (kept as original) ----
-def compute_item(storage_type, volume, days, include_wms, commodity=""):
-    st = (storage_type or "").strip()
-    st_lower = st.lower()
-    period_lt_1m = days < 30
+EXPORTS_DIR = os.path.join(os.getcwd(), "exports")
+MDF_PATH = os.path.join(EXPORTS_DIR, "MDF.xlsx")
+LOCK_PATH = os.path.join(EXPORTS_DIR, "MDF.lock")
+COLUMNS = ["Date","Time","Location","Warehouse","CounterName","SKU","SerialOrCode","QTY","Source"]
 
-    rate = 0.0
-    unit, rate_unit = "CBM", "CBM / DAY"
-    storage_fee = 0.0
+# Models
+class Line(Base):
+    __tablename__ = 'lines'
 
-    if st in ("AC", "Non-AC", "Open Shed"):
-        family = "ac" if st == "AC" else "dry"
-        bands = MATRIX[family]["lt1m"] if period_lt_1m else MATRIX[family]["ge1m"]
-        rate = _pick_rate(bands, volume)
-        storage_fee = volume * days * rate
+    id = Column(Integer, primary_key=True)
+    location = Column(String(50), nullable=False)
+    warehouse = Column(String(50), nullable=False)
+    line_code = Column(String(20), nullable=False)
+    target_qty = Column(Integer, nullable=False)
+    created_by_tl_norm = Column(String(120), nullable=True)
+    created_at = Column(DateTime, default=abu_dhabi_now)
+    updated_at = Column(DateTime, default=abu_dhabi_now, onupdate=abu_dhabi_now)
 
-    elif st == "Chemicals AC":
-        rate = 3.5; storage_fee = volume * days * rate
-    elif st == "Chemicals Non-AC (Non-DG)":
-        rate = 2.5; storage_fee = volume * days * rate
-    elif st == "Chemicals Non-AC (DG)":
-        rate = 3.0; storage_fee = volume * days * rate
-    elif st == "Chemicals Non-AC":
-        rate = 2.5; storage_fee = volume * days * rate
+    assignments = relationship("Assignment", back_populates="line")
+    scan_jobs = relationship("ScanJob", back_populates="line")
 
-    elif "open yard – kizad" in st_lower:
-        rate, unit, rate_unit = 125.0, "SQM", "SQM / YEAR"
-        storage_fee = volume * days * (rate / 365.0)
-    elif st == "Open Yard – Mussafah (Open Yard)":
-        unit, rate_unit, rate = "SQM", "SQM / MONTH", 15.0
-        storage_fee = volume * days * (rate / 30.0)
-    elif st == "Open Yard – Mussafah (Open Yard Shed)":
-        unit, rate_unit, rate = "SQM", "SQM / MONTH", 35.0
-        storage_fee = volume * days * (rate / 30.0)
-    elif st == "Open Yard – Mussafah (Jumbo Bag)":
-        unit, rate_unit, rate = "BAG", "BAG / MONTH", 19.0
-        storage_fee = volume * days * (rate / 30.0)
+    __table_args__ = (Index('idx_line_warehouse', 'line_code', 'warehouse'),)
 
-    # RMS (Premium / Normal)
-    elif st.startswith("RMS — Premium"):
-        unit, rate_unit, rate = "BOX", "BOX / MONTH", 5.0
-        storage_fee = volume * days * (rate / 30.0)
-    elif st.startswith("RMS — Normal"):
-        unit, rate_unit, rate = "BOX", "BOX / MONTH", 3.0
-        storage_fee = volume * days * (rate / 30.0)
+class Assignment(Base):
+    __tablename__ = 'assignments'
 
-    # WMS
-    is_open_yard = "open yard" in st_lower
-    is_chemical  = "chemical"  in st_lower
-    is_rms       = st_lower.startswith("rms")
-    months = max(1, days // 30)
-    wms_monthly = 625 if is_chemical else 1500
-    wms_fee = 0 if is_open_yard or not include_wms else wms_monthly * months
+    id = Column(Integer, primary_key=True)
+    line_id = Column(Integer, ForeignKey('lines.id'), nullable=False)
+    counter_name_1 = Column(String(100), nullable=False)
+    counter_name_2 = Column(String(100), nullable=False)
+    tl_name = Column(String(100), nullable=False)
+    tl_pin_hash = Column(String(256), nullable=False)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=abu_dhabi_now)
 
-    return {
-        "storage_type": st, "unit": unit, "rate": float(rate), "rate_unit": rate_unit,
-        "volume": float(volume), "days": int(days), "storage_fee": round(storage_fee, 2),
-        "include_wms": bool(include_wms and not is_open_yard), "wms_monthly": wms_monthly,
-        "months": months, "wms_fee": int(0 if is_open_yard or not include_wms else wms_monthly * months),
-        "category_standard": st in ("AC", "Non-AC", "Open Shed"),
-        "category_chemical": is_chemical, "category_openyard": is_open_yard,
-        "category_rms": is_rms,
-        "commodity": (commodity or "").strip(),
-    }
+    line = relationship("Line", back_populates="assignments")
 
-# ---------- commodity helper ----------
-def _clean_commodity(val: str) -> str:
-    s = (val or "").strip()
-    if not s: return ""
-    if re.fullmatch(r"\d+(\.\d+)?", s):
-        return ""
-    return s
+class ScanJob(Base):
+    __tablename__ = 'scan_jobs'
 
-# ---------- DOCX helpers (kept as original) ----------
-def find_quote_table(doc):
-    for t in doc.tables:
-        try:
-            head = " ".join(c.text.strip().lower() for c in t.rows[0].cells)
-        except Exception:
-            continue
-        if "item" in head and "unit rate" in head and "amount" in head:
-            return t
-    return None
+    id = Column(Integer, primary_key=True)
+    line_id = Column(Integer, ForeignKey('lines.id'), nullable=False)
+    status = Column(String(20), default='open')  # open, submitted, variance_approved
+    opened_at = Column(DateTime, default=abu_dhabi_now)
+    closed_at = Column(DateTime)
+    opened_by = Column(String(100))
 
-def _delete_row(table, row_idx):
-    row = table.rows[row_idx]
-    row._element.getparent().remove(row._element)
+    line = relationship("Line", back_populates="scan_jobs")
+    scans = relationship("Scan", back_populates="job")
+    reconciliations = relationship("Reconciliation", back_populates="job")
 
-def _clear_quote_table_keep_header(table):
-    while len(table.rows) > 1:
-        _delete_row(table, 1)
+class Scan(Base):
+    __tablename__ = 'scans'
 
-def _body_children(doc):
-    return list(doc._element.body.iterchildren())
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey('scan_jobs.id'), nullable=False)
+    line_id = Column(Integer, ForeignKey('lines.id'), nullable=False)
+    counter_name = Column(String(100), nullable=False)
+    sku = Column(String(100))
+    serial_code = Column(String(200), nullable=False)
+    qty = Column(Integer, default=1)
+    source = Column(String(20), nullable=False)  # scan, manual
+    created_at = Column(DateTime, default=abu_dhabi_now)
 
-def _el_text(el) -> str:
-    return "".join(el.itertext())
+    job = relationship("ScanJob", back_populates="scans")
 
-def _copy_blocks_between_markers(src_doc, start_tag, end_tag):
-    body = _body_children(src_doc)
-    start_i = end_i = None
-    for i, el in enumerate(body):
-        if el.tag.endswith('p') and start_tag in _el_text(el):
-            start_i = i
-        if start_i is not None and el.tag.endswith('p') and end_tag in _el_text(el):
-            end_i = i; break
-    if start_i is None or end_i is None or end_i <= start_i + 1:
-        return []
-    return [deepcopy(el) for el in body[start_i + 1:end_i]]
+    __table_args__ = (
+        Index('idx_job_serial', 'job_id', 'serial_code'),
+    )
 
-def _append_blocks(dest_doc, blocks):
-    body = dest_doc._element.body
-    for el in blocks:
-        body.append(el)
+class Reconciliation(Base):
+    __tablename__ = 'reconciliations'
 
-def _is_vas_table(tbl):
-    if not tbl.rows: return False
-    hdr = " | ".join(c.text.strip().lower() for c in tbl.rows[0].cells)
-    return ("vas" in hdr and "price" in hdr) or ("main activity" in hdr and "transaction" in hdr)
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey('scan_jobs.id'), nullable=False)
+    requested_by = Column(String(100), nullable=False)
+    reason = Column(Text)
+    previous_target = Column(Integer)
+    new_target = Column(Integer)
+    tl_approved_by = Column(String(100))
+    approved_at = Column(DateTime)
+    note = Column(Text)
+    result = Column(String(20))  # approved_variance, edited_target, rejected
 
-def _purge_all_vas_tables_and_headings(doc):
-    for p in list(doc.paragraphs):
-        t = (p.text or "").strip()
-        if t in ("Standard VAS", "Chemical VAS", "Open Yard VAS",
-                 "Terms & Conditions — Chemical", "Terms & Conditions — Open Yard",
-                 "Value Added Service Rates (Standard VAS)", "Value Added Service Rates",
-                 "RMS VAS", "Terms & Conditions — RMS"):
-            el = p._element; pa = el.getparent()
-            if pa is not None: pa.remove(el)
-    for tbl in list(doc.tables):
-        if _is_vas_table(tbl):
-            el = tbl._element; pa = el.getparent()
-            if pa is not None: pa.remove(el)
+    job = relationship("ScanJob", back_populates="reconciliations")
 
-def _safe_docx(path: str):
-    p = Path(path)
-    if not p.exists():
-        return None
+class TLUser(Base):
+    __tablename__ = "tl_users"
+
+    id = Column(Integer, primary_key=True)
+    name_norm = Column(String(120), nullable=False)      # normalized key
+    display_name = Column(String(120), nullable=False)   # what you typed
+    pin_hash = Column(String(255), nullable=True)
+    role = Column(String(20), default='tl')
+    created_at = Column(DateTime, server_default=func.now()) # This should also be updated if it represents creation time
+
+    __table_args__ = (UniqueConstraint('name_norm', name='uq_tl_users_name_norm'),)
+
+class ReconciliationQueue(Base):
+    __tablename__ = 'reconciliation_queue'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey('scan_jobs.id'), nullable=False)
+    line_id = Column(Integer, ForeignKey('lines.id'), nullable=False)
+    requested_by = Column(String(100), nullable=False)
+    reason = Column(Text)
+    scanned_total = Column(Integer, nullable=False)
+    target_qty = Column(Integer, nullable=False)
+    status = Column(String(20), default='pending')  # pending, approved, rejected
+    tl_response = Column(Text)
+    acknowledged = Column(Boolean, default=False)  # Track if counter acknowledged
+    created_at = Column(DateTime, default=abu_dhabi_now)
+    resolved_at = Column(DateTime)
+
+    job = relationship("ScanJob")
+    line = relationship("Line")
+
+class ReconciliationRequest(Base):
+    __tablename__ = 'reconciliation_requests'
+
+    id = Column(Integer, primary_key=True)
+    line_id = Column(Integer, ForeignKey('lines.id'), nullable=False)
+    job_id = Column(Integer, ForeignKey('scan_jobs.id'), nullable=False)
+    tl_name_norm = Column(String(120), nullable=False)
+    requested_by = Column(String(100), nullable=False)
+    requested_qty = Column(Integer, nullable=True)
+    status = Column(String(20), default='pending')
+    resolved_by = Column(String(100))
+    resolved_at = Column(DateTime)
+    created_at = Column(DateTime, default=abu_dhabi_now)
+
+    line = relationship("Line")
+    job = relationship("ScanJob")
+
+class AuditLog(Base):
+    __tablename__ = 'audit_log'
+
+    id = Column(Integer, primary_key=True)
+    actor = Column(String(100), nullable=False)
+    action = Column(String(100), nullable=False)
+    entity = Column(String(50), nullable=False)
+    entity_id = Column(Integer)
+    payload_json = Column(Text)
+    created_at = Column(DateTime, default=abu_dhabi_now)
+
+def init_db():
+    """Initialize database and create tables"""
+    Base.metadata.create_all(bind=engine)
+
+    # Handle database migration for missing columns and indexes
     try:
-        return Document(str(p))
-    except Exception:
-        return None
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            # Check if acknowledged column exists
+            result = conn.execute(text("PRAGMA table_info(reconciliation_queue)"))
+            columns = [row[1] for row in result.fetchall()]
 
-def _vas_blocks_from_template(path, start_tag, end_tag, heading):
-    src = _safe_docx(path)
-    if not src:
-        return []
-    blocks = _copy_blocks_between_markers(src, start_tag, end_tag)
-    if blocks:
-        tmp = Document(); hp = tmp.add_paragraph(heading); hp.runs[0].bold = True
-        return [deepcopy(hp._element)] + blocks
-    for tbl in src.tables:
-        if _is_vas_table(tbl):
-            tmp = Document(); hp = tmp.add_paragraph(heading); hp.runs[0].bold = True
-            return [deepcopy(hp._element), deepcopy(tbl._element)]
-    return []
+            if 'acknowledged' not in columns:
+                print("Adding missing 'acknowledged' column to reconciliation_queue table...")
+                conn.execute(text("ALTER TABLE reconciliation_queue ADD COLUMN acknowledged BOOLEAN DEFAULT 0"))
+                conn.commit()
+                print("Database migration completed successfully")
 
-def _find_para_el_contains(doc, needle):
-    for p in doc.paragraphs:
-        if needle.lower() in (p.text or "").lower():
-            return p._element
-    return None
+            # Check if created_by_tl_norm column exists in lines table
+            result = conn.execute(text("PRAGMA table_info(lines)"))
+            line_columns = [row[1] for row in result.fetchall()]
 
-def _move_element_after(doc, moving_el, after_el):
-    if moving_el is None or after_el is None: return
-    body = doc._element.body
-    par = moving_el.getparent()
-    if par is not None: par.remove(moving_el)
-    idx = body.index(after_el)
-    body.insert(idx + 1, moving_el)
+            if 'created_by_tl_norm' not in line_columns:
+                print("Adding missing 'created_by_tl_norm' column to lines table...")
+                conn.execute(text("ALTER TABLE lines ADD COLUMN created_by_tl_norm VARCHAR(120)"))
+                conn.commit()
+                print("Added created_by_tl_norm column")
 
-def _set_table_line_spacing(table, rule=WD_LINE_SPACING.ONE_POINT_FIVE):
-    for row in table.rows:
-        for cell in row.cells:
-            for p in cell.paragraphs:
-                p.paragraph_format.line_spacing_rule = rule
+            # Check if role column exists in tl_users table
+            result = conn.execute(text("PRAGMA table_info(tl_users)"))
+            tl_columns = [row[1] for row in result.fetchall()]
 
-def _rebuild_quotation_table(doc, items, grand_total):
-    qt = find_quote_table(doc)
-    if not qt:
-        doc.add_paragraph()
-        qt = doc.add_table(rows=1, cols=3)
-        hdr = qt.rows[0].cells
-        hdr[0].text, hdr[1].text, hdr[2].text = "Item", "Unit Rate", "Amount (AED)"
-    _clear_quote_table_keep_header(qt)
+            if 'role' not in tl_columns:
+                print("Adding missing 'role' column to tl_users table...")
+                conn.execute(text("ALTER TABLE tl_users ADD COLUMN role VARCHAR(20) DEFAULT 'tl'"))
+                conn.commit()
+                print("Added role column")
 
-    for it in items:
-        r = qt.add_row().cells
-        r[0].text = it['storage_type']
-        r[1].text = f"{it['rate']:.2f} AED / {it['rate_unit']}"
-        r[2].text = f"{it['storage_fee']:,.2f} AED"
-        if it["include_wms"]:
-            r = qt.add_row().cells
-            r[0].text = f"WMS — {it['storage_type']} ({it['months']} month{'s' if it['months']!=1 else ''})"
-            r[1].text = f"{it['wms_monthly']:.2f} AED / MONTH"
-            r[2].text = f"{it['wms_fee']:,.2f} AED"
-
-    total_row = qt.add_row().cells
-    total_row[0].text = "Total Fee"; total_row[1].text = ""; total_row[2].text = f"{grand_total:,.2f} AED"
-    for p in total_row[0].paragraphs:
-        for run in p.runs: run.bold = True; run.font.size = Pt(11)
-    for p in total_row[2].paragraphs:
-        for run in p.runs: run.bold = True; run.font.size = Pt(11)
-    _set_table_line_spacing(qt, WD_LINE_SPACING.ONE_POINT_FIVE)
-    return qt
-
-def _delete_summary_lines_for_multi(doc):
-    targets = ("Storage Period:", "Storage Size:",
-               "We trust that the rates", "Yours Faithfully", "DSV Solutions PJSC", "Validity:")
-    to_remove = []
-    for p in doc.paragraphs:
-        t = (p.text or "").strip().lower()
-        if any(t.startswith(x.lower()) for x in targets) or "value added service rates" in t:
-            to_remove.append(p)
-    for p in set(to_remove):
-        el = p._element; pa = el.getparent()
-        if pa is not None: pa.remove(el)
-
-def _append_terms_from_template(path,
-                                terms_heading="Storage Terms and Conditions:",
-                                end_markers=("Validity:", "We trust that")):
-    src = _safe_docx(path)
-    if not src:
-        return []
-    body = _body_children(src)
-    start_i = None
-    for i, el in enumerate(body):
-        if el.tag.endswith("p") and terms_heading.lower() in _el_text(el).lower():
-            start_i = i; break
-    if start_i is None: return []
-    end_i = len(body)
-    for j in range(start_i + 1, len(body)):
-        if body[j].tag.endswith("p"):
-            txt = _el_text(body[j]).strip()
-            if any(m.lower() in txt.lower() for m in end_markers):
-                end_i = j; break
-    return [deepcopy(el) for el in body[start_i + 1:end_i]]
-
-def _remove_base_terms(doc, terms_heading="Storage Terms and Conditions:"):
-    body = _body_children(doc)
-    start_i = None
-    for i, el in enumerate(body):
-        if el.tag.endswith('p') and terms_heading.lower() in _el_text(el).lower():
-            start_i = i; break
-    if start_i is None: return
-    for j in range(len(body) - 1, start_i - 1, -1):
-        parent = body[j].getparent()
-        if parent is not None:
-            parent.remove(body[j])
-
-def _strip_marker_text(doc):
-    tags = ["[VAS_STANDARD]", "[/VAS_STANDARD]",
-            "[VAS_CHEMICAL]", "[/VAS_CHEMICAL]",
-            "[VAS_OPENYARD]", "[/VAS_OPENYARD]",
-            "[VAS_RMS]", "[/VAS_RMS]"]
-    for p in doc.paragraphs:
-        t = p.text or ""; new = t
-        for tg in tags: new = new.replace(tg, "")
-        if new != t:
-            for r in p.runs: r.text = ""
-            p.add_run(new)
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    t = p.text or ""; new = t
-                    for tg in tags: new = new.replace(tg, "")
-                    if new != t:
-                        for r in p.runs: r.text = ""
-                        p.add_run(new)
-
-# ---------- ROUTE: generate (original multi-item + VAS/Terms logic) ----------
-@app.route("/generate", methods=["POST"])
-def generate():
-    storage_types = request.form.getlist("storage_type") or [request.form.get("storage_type", "")]
-    volumes       = request.form.getlist("volume")       or [request.form.get("volume", 0)]
-    days_list     = request.form.getlist("days")         or [request.form.get("days", 0)]
-    wms_list      = request.form.getlist("wms")          or [request.form.get("wms", "No")]
-    commodities_raw = request.form.getlist("commodity")  or [request.form.get("commodity", "")]
-    canonical_commodity = next((c for c in (_clean_commodity(v) for v in commodities_raw) if c), "")
-
-    # RMS sub-fields
-    rms_tier_list  = request.form.getlist("rms_tier")  or []
-    rms_boxes_list = request.form.getlist("rms_boxes") or []
-
-    n = max(len(storage_types), len(volumes), len(days_list), len(wms_list))
-    storage_types += [""] * (n - len(storage_types))
-    volumes       += [0]  * (n - len(volumes))
-    days_list     += [0]  * (n - len(days_list))
-    wms_list      += ["No"] * (n - len(wms_list))
-    if len(rms_tier_list)  < n: rms_tier_list  += [""] * (n - len(rms_tier_list))
-    if len(rms_boxes_list) < n: rms_boxes_list += ["0"] * (n - len(rms_boxes_list))
-
-    items = []
-    for i in range(n):
-        raw_st = storage_types[i]
-        vol = float(volumes[i] or 0)
-        d   = int(days_list[i] or 0)
-        inc = (wms_list[i] == "Yes")
-        com = _clean_commodity(commodities_raw[i] if i < len(commodities_raw) else "") or canonical_commodity
-
-        st_lower = (raw_st or "").strip().lower()
-        if st_lower == "rms":
-            tier = (rms_tier_list[i] or "").strip()
-            st_label = ("RMS — Premium AC Facility"
-                        if "premium" in tier.lower() else "RMS — Normal AC Facility")
-            vol = float(rms_boxes_list[i] or 0)  # boxes
-            inc = True  # WMS always ON for RMS
-            items.append(compute_item(st_label, vol, d, inc, com))
-            continue
-
-        if "open yard" in st_lower:
-            inc = False
-
-        if not raw_st:
-            continue
-        items.append(compute_item(raw_st, vol, d, inc, com))
-
-    # WMS aggregation for RMS combos (kept from original)
-    if len(items) > 1:
-        has_rms  = any(it.get("category_rms") for it in items)
-        has_std  = any(it.get("category_standard") for it in items)
-        has_chem = any(it.get("category_chemical") for it in items)
-
-        def _max_months(filter_fn):
-            vals = [it["months"] for it in items if filter_fn(it)]
-            return max(vals) if vals else 0
-
-        if has_rms and has_std and not has_chem:
-            months_agg = max(
-                _max_months(lambda x: x.get("category_rms")),
-                _max_months(lambda x: x.get("category_standard") and x.get("include_wms"))
-            ) or _max_months(lambda x: x.get("category_rms")) or 1
-            for it in items:
-                if it.get("category_rms") or (it.get("category_standard") and it.get("include_wms")):
-                    it["wms_fee"] = 0
-                    it["include_wms"] = False
-            carrier = next((it for it in items if it.get("category_rms")), items[0])
-            carrier["include_wms"] = True
-            carrier["wms_monthly"] = 1500
-            carrier["months"] = months_agg
-            carrier["wms_fee"] = 1500 * months_agg
-
-        elif has_rms and has_chem:
-            rms_months  = _max_months(lambda x: x.get("category_rms")) or 1
-            chem_months = _max_months(lambda x: x.get("category_chemical")) or 1
-            for it in items:
-                if it.get("category_rms") or it.get("category_chemical"):
-                    it["wms_fee"] = 0
-                    it["include_wms"] = False
-            rms_carrier = next((it for it in items if it.get("category_rms")), items[0])
-            rms_carrier["include_wms"] = True
-            rms_carrier["wms_monthly"] = 1500
-            rms_carrier["months"] = rms_months
-            rms_carrier["wms_fee"] = 1500 * rms_months
-            chem_carrier = next((it for it in items if it.get("category_chemical")), None)
-            if chem_carrier:
-                chem_carrier["include_wms"] = True
-                chem_carrier["wms_monthly"] = 625
-                chem_carrier["months"] = chem_months
-                chem_carrier["wms_fee"] = 625 * chem_months
-
-    if not items:
-        items = [compute_item("AC", 0.0, 0, False)]
-
-    today_str = datetime.today().strftime("%d %b %Y")
-
-    # Choose template
-    if len(items) == 1:
-        st0 = items[0]["storage_type"].lower()
-        if "chemical" in st0: template_path = "templates/Chemical VAS.docx"
-        elif "open yard" in st0: template_path = "templates/Open Yard VAS.docx"
-        elif st0.startswith("rms"):
-            template_path = "templates/RMS VAS.docx" if _safe_docx("templates/RMS VAS.docx") else "templates/Standard VAS.docx"
-        else: template_path = "templates/Standard VAS.docx"
-    else:
-        template_path = "templates/Standard VAS.docx"
-
-    doc = Document(template_path)
-
-    total_storage = round(sum(i["storage_fee"] for i in items), 2)
-    total_wms     = round(sum(i["wms_fee"]    for i in items), 2)
-    grand_total   = round(total_storage + total_wms, 2)
-
-    # Fill placeholders
-    if len(items) == 1:
-        one = items[0]
-        unit_for_display = one["unit"]; unit_rate_text = f"{one['rate']:.2f} AED / {one['rate_unit']}"
-        wms_status = "" if one["category_openyard"] else ("INCLUDED" if one["include_wms"] else "NOT INCLUDED")
-        storage_type_text = one["storage_type"]; days_text = str(one["days"]); volume_text = str(one["volume"])
-        commodity_text = one.get("commodity") or canonical_commodity or "N/A"
-    else:
-        st_lines = []
-        for it in items:
-            qty = f"{it['volume']} {it['unit']}".strip()
-            dur = f"{it['days']} day{'s' if it['days'] != 1 else ''}"
-            st_lines.append(f"{it['storage_type']} ({qty} × {dur})")
-        storage_type_text = "\n".join(st_lines)
-        cm_lines = []
-        for it in items:
-            cm = it.get("commodity") or canonical_commodity or "N/A"
-            cm_lines.append(f"{it['storage_type']} — {cm}")
-        commodity_text = "\n".join(cm_lines)
-        unit_for_display = ""; unit_rate_text = "—"
-        days_text = "VARIOUS"; volume_text = "VARIOUS"
-        wms_status = "SEE BREAKDOWN"
-
-    placeholders = {
-        "{{STORAGE_TYPE}}": storage_type_text, "{{DAYS}}": days_text, "{{VOLUME}}": volume_text,
-        "{{UNIT}}": unit_for_display, "{{WMS_STATUS}}": wms_status, "{{UNIT_RATE}}": unit_rate_text,
-        "{{STORAGE_FEE}}": f"{total_storage:,.2f} AED", "{{WMS_FEE}}": f"{total_wms:,.2f} AED",
-        "{{TOTAL_FEE}}": f"{grand_total:,.2f} AED", "{{TODAY_DATE}}": today_str,
-        "{{COMMODITY}}": commodity_text,
-        "1,500.00 AED / MONTH": "625.00 AED / MONTH" if any(i["category_chemical"] for i in items) else "1,500.00 AED / MONTH",
-    }
-
-    def replace_in_paragraph(paragraph, mapping):
-        if not paragraph.runs: return
-        full = "".join(r.text for r in paragraph.runs); new = full
-        for k, v in mapping.items(): new = new.replace(k, v)
-        if new != full:
-            for r in paragraph.runs: r.text = ""
-            paragraph.runs[0].text = new
-
-    def replace_all(doc_obj, mapping):
-        for p in doc_obj.paragraphs: replace_in_paragraph(p, mapping)
-        for table in doc_obj.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for p in cell.paragraphs: replace_in_paragraph(p, mapping)
-
-    replace_all(doc, placeholders)
-
-    if len(items) > 1:
-        _delete_summary_lines_for_multi(doc)
-
-    qt = _rebuild_quotation_table(doc, items, grand_total)
-
-    # Insert VAS + Terms as per items (original logic)
-    used_standard = any(i["category_standard"] for i in items)
-    used_chemical = any(i["category_chemical"] for i in items)
-    used_openyard = any(i["category_openyard"] for i in items)
-    used_rms      = any(i.get("category_rms") for i in items)
-
-    if len(items) > 1:
-        _purge_all_vas_tables_and_headings(doc)
-
-        fam_order = []
-        for it in items:
-            fam = ("rms" if it.get("category_rms") else
-                   "standard" if it["category_standard"] else
-                   "chemical" if it["category_chemical"] else
-                   "openyard" if it["category_openyard"] else None)
-            if fam and fam not in fam_order: fam_order.append(fam)
-
-        family_blocks = []
-        for fam in fam_order:
-            if fam == "standard" and used_standard:
-                family_blocks += _vas_blocks_from_template("templates/Standard VAS.docx", "[VAS_STANDARD]", "[/VAS_STANDARD]", "Standard VAS")
-            elif fam == "chemical" and used_chemical:
-                family_blocks += _vas_blocks_from_template("templates/Chemical VAS.docx", "[VAS_CHEMICAL]", "[/VAS_CHEMICAL]", "Chemical VAS")
-            elif fam == "openyard" and used_openyard:
-                family_blocks += _vas_blocks_from_template("templates/Open Yard VAS.docx", "[VAS_OPENYARD]", "[/VAS_OPENYARD]", "Open Yard VAS")
-            elif fam == "rms" and used_rms:
-                family_blocks += _vas_blocks_from_template("templates/RMS VAS.docx", "[VAS_RMS]", "[/VAS_RMS]", "RMS VAS")
-
-        note_el = _find_para_el_contains(doc, "Minimum Monthly storage charges")
-        anchor = note_el if (note_el is not None and qt is not None) else (qt._element if qt is not None else None)
-        if note_el is not None and qt is not None:
-            _move_element_after(doc, note_el, qt._element)
-        if anchor is not None and family_blocks:
-            idx = doc._element.body.index(anchor)
-            for i, el in enumerate(family_blocks):
-                doc._element.body.insert(idx + 1 + i, el)
-        else:
-            _append_blocks(doc, family_blocks)
-
-        _remove_base_terms(doc)
-
-        combined = []
-        if used_standard: combined += _append_terms_from_template("templates/Standard VAS.docx")
-        if used_chemical: combined += _append_terms_from_template("templates/Chemical VAS.docx")
-        if used_openyard: combined += _append_terms_from_template("templates/Open Yard VAS.docx")
-        if used_rms:      combined += _append_terms_from_template("templates/RMS VAS.docx")
-
-        doc.add_paragraph(" ")
-        doc.add_paragraph("Terms & Conditions — Combined"); h = doc.paragraphs[-1]; h.runs[0].bold = True
-
-        seen = set()
-        non_haz_line = "The above rates offered are for non-Haz cargo."
-        keep_non_haz = not any(it["storage_type"] == "Chemicals AC" for it in items)
-
-        for el in combined:
-            if not el.tag.endswith('p'):
-                continue
-            raw = _el_text(el).strip()
-            if not raw:
-                continue
-            norm = re.sub(r"\s+", " ", raw).strip().lower()
-            if not keep_non_haz and non_haz_line.lower() in norm:
-                continue
-            if norm in seen:
-                continue
-            seen.add(norm)
-            doc._element.body.append(deepcopy(el))
-
-        if keep_non_haz and non_haz_line.lower() not in seen:
-            doc.add_paragraph(non_haz_line)
-
-        doc.add_paragraph(" ")
-        doc.add_paragraph("Validity: 15 Days")
-        doc.add_paragraph("")
-        doc.add_paragraph("We trust that the rates and services provided are to your satisfaction and should you require any further details please do not hesitate to contact me.")
-        doc.add_paragraph("Yours Faithfully,")
-        doc.add_paragraph("")
-        doc.add_paragraph("DSV Solutions PJSC")
-
-    _strip_marker_text(doc)
-
-    os.makedirs("generated", exist_ok=True)
-    filename = f"Quotation_{(request.form.get('commodity') or 'quotation').strip() or 'quotation'}.docx"
-    output_path = os.path.join("generated", filename)
-    doc.save(output_path)
-    return send_file(output_path, as_attachment=True)
-
-# ========================== RAG (index + retrieval) ==========================
-def _list_files_for_rag():
-    files = []
-    for folder in RAG_FOLDERS:
-        base = Path(folder)
-        if not base.exists():
-            log.warning(f"RAG folder not found: {folder}")
-            continue
-        
-        log.info(f"Scanning folder: {folder}")
-        folder_files = 0
-        for p in base.rglob("*"):
-            if not p.is_file():
-                continue
-            if any(part in EXCLUDE_DIRS for part in p.parts):
-                continue
-            if not any(fnmatch.fnmatch(p.name, g) for g in RAG_GLOBS):
-                continue
+            # Remove old unique constraint if it exists and add new composite index
             try:
-                size = p.stat().st_size
-                if size > MAX_FILE_BYTES:
-                    log.warning(f"File too large, skipping: {p} ({size} bytes)")
-                    continue
-                if size == 0:
-                    log.warning(f"Empty file, skipping: {p}")
-                    continue
-            except Exception:
-                pass
-            files.append(p)
-            folder_files += 1
-        
-        log.info(f"Found {folder_files} files in {folder}")
-    
-    # Prioritize CHATBOT INFO files
-    chatbot_files = [f for f in files if "CHATBOT INFO" in str(f)]
-    other_files = [f for f in files if "CHATBOT INFO" not in str(f)]
-    files = chatbot_files + other_files
-    
-    seen, out = set(), []
-    for p in files:
-        key = str(p.resolve())
-        if key not in seen:
-            seen.add(key); out.append(p)
-    
-    log.info(f"Total files for RAG: {len(out)} ({len(chatbot_files)} from CHATBOT INFO)")
-    return out
+                # Check if old constraint exists
+                result = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='index' AND name='unique_job_serial'"))
+                if result.fetchone():
+                    print("Removing old unique constraint...")
+                    conn.execute(text("DROP INDEX IF EXISTS unique_job_serial"))
+                    conn.commit()
 
-def _read_pdf_file(p: Path) -> str:
-    try:
-        from pypdf import PdfReader
-        log.info(f"Attempting to read PDF: {p}")
-        reader = PdfReader(str(p))
-        out = []
-        total_pages = len(reader.pages)
-        log.info(f"PDF {p.name} has {total_pages} pages")
-        
-        for i, page in enumerate(reader.pages[:120]):  # Limit to first 120 pages
-            try:
-                txt = page.extract_text()
-                if txt and txt.strip():
-                    clean_txt = txt.strip()
-                    out.append(clean_txt)
-                    if i < 3:  # Log first few pages for debugging
-                        log.info(f"Page {i} text preview: {clean_txt[:200]}...")
-            except Exception as e:
-                log.warning(f"Error extracting text from page {i} of {p}: {e}")
-                continue
-        
-        result = "\n".join(out)
-        if result:
-            log.info(f"Successfully extracted {len(result)} characters from PDF: {p.name}")
-        else:
-            log.warning(f"No text extracted from PDF: {p.name}")
-        return result
-    except ImportError as e:
-        log.error(f"pypdf not available: {e}")
-        return ""
+                # Add composite unique index for proper duplicate checking
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_scans_job_sku_serial "
+                    "ON scans (job_id, sku, serial_code)"
+                ))
+                conn.commit()
+                print("Added composite unique index for scan duplicates")
+            except Exception as idx_e:
+                print(f"Index creation warning: {idx_e}")
+
     except Exception as e:
-        log.error(f"Error reading PDF file {p}: {e}")
-        return ""
+        print(f"Database migration warning: {e}")
+        # Continue anyway as this is not critical
 
-def _file_text_for_rag(p: Path) -> str:
-    suf = p.suffix.lower()
-    if suf in (".txt",".md",".py",".js",".ts",".html",".css"):
-        try: return p.read_text(encoding="utf-8", errors="ignore")
-        except: return ""
-    if suf == ".docx":
+def ensure_mdf():
+    """Ensure MDF.xlsx exists with proper headers"""
+    os.makedirs(EXPORTS_DIR, exist_ok=True)
+    if not os.path.exists(MDF_PATH):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+        ws.append(COLUMNS)
+        wb.save(MDF_PATH)
+        print(f"Created {MDF_PATH} with headers")
+
+@app.before_request
+def _boot():
+    if not hasattr(app, '_initialized'):
+        with app.app_context():
+            init_db()
+            ensure_mdf()
+        app._initialized = True
+
+def hash_pin(pin):
+    """Hash PIN for secure storage"""
+    return hashlib.sha256(pin.encode()).hexdigest()
+
+def verify_pin(pin, pin_hash):
+    """Verify PIN against hash"""
+    return hashlib.sha256(pin.encode()).hexdigest() == pin_hash
+
+def _norm(s):
+    """Normalize string for case-insensitive comparison"""
+    return (s or "").strip().casefold()
+
+def _require_tl():
+    return bool(session.get("tl_session"))
+
+def _session_user():
+    s = session.get("tl_session") or {}
+    return s.get("display_name",""), s.get("name_norm","")
+
+def _is_manager():
+    _, nn = _session_user()
+    db = SessionLocal()
+    try:
+        u = db.query(TLUser).filter_by(name_norm=nn).first()
+        return bool(u and u.role == "manager")
+    finally:
+        db.close()
+
+def norm_sku(s):
+    """Normalize SKU for consistent storage"""
+    return re.sub(r"[^A-Za-z0-9\-_]", "", (s or "").strip()).upper()
+
+def norm_code(s):
+    """Normalize serial/code for consistent storage"""
+    return re.sub(r"[^A-Za-z0-9\-_]", "", (s or "").strip()).upper()
+
+# Routes
+@app.route('/signin')
+def signin():
+    return render_template('signin.html')
+
+@app.route('/')
+def home():
+    return render_template('home.html', locations=LOCATIONS, warehouses=WAREHOUSES)
+
+@app.route('/count')
+def count():
+    location = request.args.get('location')
+    warehouse = request.args.get('warehouse')
+    line_code = request.args.get('line')
+    counter = request.args.get('counter')
+
+    if not all([location, warehouse, line_code, counter]):
+        return redirect('/')
+
+    return render_template('count.html',
+                         location=location,
+                         warehouse=warehouse,
+                         line_code=line_code,
+                         counter=counter)
+
+@app.route('/reconcile')
+def reconcile_page():
+    return render_template('reconcile_center.html')
+
+@app.route('/log')
+def log():
+    db = SessionLocal()
+    try:
+        # Get completed jobs from database
+        jobs = db.query(ScanJob).filter(
+            ScanJob.status.in_(['submitted', 'variance_approved'])
+        ).order_by(ScanJob.closed_at.desc()).all()
+
+        job_data = []
+
+        # Add database jobs
+        for job in jobs:
+            total_scans = db.query(Scan).filter(Scan.job_id == job.id).count()
+            total_qty = db.query(func.sum(Scan.qty)).filter(Scan.job_id == job.id).scalar() or 0
+
+            job_data.append({
+                'line': job.line,
+                'total_scans': total_scans,
+                'total_qty': int(total_qty),
+                'closed_at': job.closed_at,
+                'status': job.status,
+                'source': 'database'
+            })
+
+        # Also read historical data from MDF Excel file
         try:
-            d=Document(str(p))
-            parts=[]
-            for para in d.paragraphs:
-                if para.text.strip(): parts.append(para.text.strip())
-            for tbl in d.tables:
-                for row in tbl.rows:
-                    cells=[c.text.strip() for c in row.cells]
-                    if any(cells): parts.append(" | ".join(cells))
-            return "\n".join(parts)
-        except: return ""
-    if suf == ".xlsx":
-        try:
-            xls=pd.ExcelFile(str(p))
-            out=[]
-            for sh in xls.sheet_names:
-                df=pd.read_excel(xls,sheet_name=sh,header=None).astype(str)
-                out.append(f"### Sheet: {sh}")
-                out.append(df.head(200).to_csv(index=False,header=False))
-            return "\n".join(out)
-        except: return ""
-    if suf == ".pdf":
-        return _read_pdf_file(p)
-    return ""
+            if os.path.exists(MDF_PATH):
+                df = pd.read_excel(MDF_PATH)
+                if not df.empty and len(df) > 0:
+                    # Group by date, location, warehouse, and first counter name to identify unique jobs
+                    historical_jobs = df.groupby(['Date', 'Location', 'Warehouse', 'CounterName']).agg({
+                        'QTY': 'sum',
+                        'SerialOrCode': 'count',
+                        'Time': 'max'  # Get latest time for that job
+                    }).reset_index()
 
-def _build_or_load_index_rag():
-    """Build embeddings once, cached by content signature; reload if files change."""
-    if not os.getenv("OPENAI_API_KEY"):
-        return np.zeros((0,1536),dtype=np.float32), []
+                    # Add historical jobs that aren't already in the database
+                    for _, row in historical_jobs.iterrows():
+                        # Create a mock line object for display
+                        class MockLine:
+                            def __init__(self, location, warehouse, counter):
+                                self.location = location
+                                self.warehouse = warehouse
+                                self.line_code = f"Historical-{counter}"
+                                self.target_qty = "N/A"
 
-    client=OpenAI()
-    files=_list_files_for_rag()
+                        # Parse the date and time
+                        date_str = str(row['Date'])
+                        time_str = str(row['Time'])
 
-    sig=[]
-    for p in files:
-        try: sig.append(f"{p}:{int(p.stat().st_mtime)}:{p.stat().st_size}")
-        except: pass
-    signature=hashlib.md5("|".join(sorted(sig)).encode("utf-8")).hexdigest()
+                        try:
+                            if 'T' in date_str:  # ISO format
+                                closed_at = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                            else:
+                                # Try to combine date and time
+                                datetime_str = f"{date_str} {time_str}"
+                                closed_at = datetime.strptime(datetime_str, '%Y-%m-%d %H:%M:%S')
+                        except:
+                            closed_at = abu_dhabi_now()  # Fallback
 
-    if RAG_INDEX_PATH.exists() and RAG_META_PATH.exists():
-        try:
-            saved=json.loads(RAG_META_PATH.read_text())
-            if saved.get("signature")==signature:
-                vecs=np.load(RAG_INDEX_PATH)["vectors"]
-                return vecs, saved["meta"]
-        except: pass
+                        job_data.append({
+                            'line': MockLine(row['Location'], row['Warehouse'], row['CounterName']),
+                            'total_scans': int(row['SerialOrCode']),
+                            'total_qty': int(row['QTY']),
+                            'closed_at': closed_at,
+                            'status': 'historical',
+                            'source': 'excel'
+                        })
+        except Exception as e:
+            print(f"Error reading historical data: {e}")
 
-    meta=[]; chunks=[]
-    for p in files:
-        text=_file_text_for_rag(p)
-        if not text: continue
-        i, n = 0, len(text)
-        while i < n and len(chunks) < MAX_TOTAL_CHUNKS:
-            j = min(n, i + CHARS_PER_CHUNK)
-            chunk_text = text[i:j]
-            chunks.append(chunk_text); meta.append({"path": str(p), "text": chunk_text})
-            if j == n: break
-            i = max(0, j - CHUNK_OVERLAP)
-        if len(chunks) >= MAX_TOTAL_CHUNKS: break
+        # Sort all jobs by closed_at date (newest first), handling None values
+        job_data.sort(key=lambda x: x['closed_at'] or datetime.min, reverse=True)
 
-    if not chunks:
-        RAG_META_PATH.write_text(json.dumps({"signature":signature,"meta":[]}))
-        np.savez_compressed(RAG_INDEX_PATH, vectors=np.zeros((0,1536),dtype=np.float32))
-        return np.zeros((0,1536),dtype=np.float32), []
+        return render_template('log.html', jobs=job_data)
+    finally:
+        db.close()
 
-    vecs=[]
-    for i in range(0,len(chunks),EMBED_BATCH):
-        emb=client.embeddings.create(model=EMB_MODEL, input=chunks[i:i+EMBED_BATCH])
-        vecs.extend([e.embedding for e in emb.data])
-    vecs=np.array(vecs,dtype=np.float32)
+# API Routes
+@app.route('/api/tl/login', methods=['POST'])
+def api_tl_login():
+    """Validate TL PIN and create session"""
+    data = request.get_json(force=True)
+    tl_name = (data.get("tl_name") or "").strip()
+    tl_pin = (data.get("tl_pin") or "").strip()
+    tl_display_name = (data.get("tl_display_name") or tl_name).strip()
 
-    np.savez_compressed(RAG_INDEX_PATH, vectors=vecs)
-    RAG_META_PATH.write_text(json.dumps({"signature":signature,"meta":meta}))
-    return vecs, meta
+    if not tl_name or not tl_pin:
+        return jsonify({"ok": False, "reason": "missing"}), 400
 
-def _ensure_index():
-    global RAG_VECTORS, RAG_META
-    if RAG_VECTORS.shape[0]==0 or not RAG_META:
-        RAG_VECTORS, RAG_META = _build_or_load_index_rag()
-        log.info("RAG index ready: %d chunks from %d paths",
-                 RAG_VECTORS.shape[0], len({m['path'] for m in RAG_META}))
+    db = SessionLocal()
+    try:
+        name_norm = _norm(tl_name)
 
-# Build index once at startup
-_ensure_index()
+        # Check if this is a manager (super user)
+        managers = ["jawad", "biju", "hossam"]
+        is_manager_name = name_norm in managers
 
-def _tokenize(s: str):
-    return re.findall(r"[a-z0-9]+", (s or "").lower())
+        if is_manager_name and tl_pin == "112233":
+            # Manager login with master passcode
+            session.permanent = True
+            set_tl_session(tl_name, tl_display_name)
+            session['is_manager'] = True
 
-def _search_rag(query: str, top_k: int = TOP_K) -> list:
-    """Enhanced semantic + keyword search with chatbot folder priority."""
-    if RAG_VECTORS.shape[0] == 0: return []
-    client = OpenAI()
-    resp = client.embeddings.create(input=[query], model=EMB_MODEL)
-    q_emb = np.array(resp.data[0].embedding, dtype=np.float32)
-    scores = np.dot(RAG_VECTORS, q_emb)
-
-    # Enhanced keyword matching with more comprehensive terms
-    words = set(re.findall(r'\w+', query.lower()))
-    storage_keywords = {'storage', 'warehouse', 'facility', 'depot'}
-    rate_keywords = {'rate', 'price', 'cost', 'fee', 'charge', 'tariff', 'aed'}
-    service_keywords = {'ac', 'non-ac', 'chemical', 'rms', 'standard', 'vas', 'open', 'yard'}
-    company_keywords = {'dsv', 'solutions', 'pjsc'}
-
-    for i, meta in enumerate(RAG_META):
-        txt = meta['text'].lower()
-        path = meta['path'].lower()
-
-        # Exact phrase matching for better accuracy
-        if any(phrase in txt for phrase in [w for w in words if len(w) > 2]):
-            scores[i] += 0.2
-
-        # Category-specific keyword boosts
-        storage_hits = sum(1 for w in storage_keywords if w in txt and w in query.lower())
-        rate_hits = sum(1 for w in rate_keywords if w in txt and w in query.lower())
-        service_hits = sum(1 for w in service_keywords if w in txt and w in query.lower())
-        company_hits = sum(1 for w in company_keywords if w in txt and w in query.lower())
-
-        scores[i] += 0.3 * storage_hits
-        scores[i] += 0.35 * rate_hits  # Boost rate-related content more
-        scores[i] += 0.25 * service_hits
-        scores[i] += 0.2 * company_hits
-
-        # MASSIVE boost for chatbot info folder (your main documentation)
-        if 'chatbot info' in path or 'chatbot' in path:
-            scores[i] += 0.8
-
-        # High boost for specific rate/terms PDFs
-        if path.endswith('.pdf'):
-            scores[i] += 0.3
-            # Extra boost for specific document types
-            if any(doc_type in path for doc_type in ['rates', 'standard rates', 'chemical rates', 'rms', 'terms']):
-                scores[i] += 0.4
-
-        # Boost template files for VAS and terms info
-        if 'templates/' in path and any(keyword in path for keyword in ['vas', 'standard', 'chemical', 'rms']):
-            scores[i] += 0.3
-
-        # Penalize very short chunks that might not have context
-        if len(meta['text']) < 100:
-            scores[i] -= 0.1
-
-    top_ids = np.argsort(scores)[-top_k:][::-1]
-    # Lower threshold to catch more relevant content
-    return [RAG_META[i] for i in top_ids if scores[i] > 0.05]
-
-def _build_context_from_docs(search_results):
-    """Build context from search results with smart prioritization."""
-    if not search_results:
-        return None
-
-    # Sort results by source priority and relevance score
-    def source_priority(result):
-        path = result['path'].lower()
-        if 'chatbot info' in path or 'chatbot' in path:
-            return 0  # Highest priority
-        elif 'rates' in path or 'terms' in path:
-            return 1  # High priority
-        elif 'templates' in path:
-            return 2  # Medium priority
-        else:
-            return 3  # Lower priority
-
-    # Sort by priority first, then by text length (longer chunks often have more complete info)
-    sorted_results = sorted(search_results, key=lambda x: (source_priority(x), -len(x['text'])))
-
-    context_parts = []
-    total_chars = 0
-    max_context = 12000  # Increased context window for better accuracy
-    sources_used = set()
-
-    # First pass: Add high-priority sources
-    for result in sorted_results:
-        if source_priority(result) > 1:  # Skip lower priority in first pass
-            continue
-
-        chunk = result["text"]
-        path = result["path"]
-
-        # For high-priority sources, include more complete chunks
-        if total_chars + len(chunk) > max_context * 0.7:
-            continue
-
-        source_info = f"Source: {path}"
-        context_parts.append(f"{source_info}\n{chunk}")
-        total_chars += len(chunk) + len(source_info) + 2
-        sources_used.add(path)
-
-    # Second pass: Fill remaining space with other sources
-    for result in sorted_results:
-        if result['path'] in sources_used:
-            continue
-
-        chunk = result["text"]
-        path = result["path"]
-
-        if total_chars + len(chunk) > max_context:
-            # Try to fit a partial chunk if there's space
-            remaining_space = max_context - total_chars - 100
-            if remaining_space > 200:
-                chunk = chunk[:remaining_space]
+            # Create or update TL user with manager role
+            tl_user = db.query(TLUser).filter(TLUser.name_norm == name_norm).first()
+            if not tl_user:
+                tl_user = TLUser(
+                    name_norm=name_norm,
+                    display_name=tl_display_name,
+                    pin_hash=generate_password_hash(tl_pin),
+                    role='manager'
+                )
+                db.add(tl_user)
             else:
-                break
+                tl_user.role = 'manager'
+            db.commit()
 
-        source_info = f"Source: {path}"
-        context_parts.append(f"{source_info}\n{chunk}")
-        total_chars += len(chunk) + len(source_info) + 2
-        sources_used.add(path)
+            return jsonify({"ok": True, "manager": True})
 
-    if not context_parts:
-        return None
+        # Look up TL user
+        tl_user = db.query(TLUser).filter(TLUser.name_norm == name_norm).first()
 
-    return "\n\n---\n\n".join(context_parts)
+        if not tl_user:
+            # First time - create TL user
+            tl_user = TLUser(
+                name_norm=name_norm,
+                display_name=tl_display_name,
+                pin_hash=generate_password_hash(tl_pin)
+            )
+            db.add(tl_user)
+            db.commit()
 
-def _has_strong_ctx(ctx_blocks: list, question: str) -> bool:
-    if not ctx_blocks:
-        return False
-    total_len = sum(len(md["text"]) for md in ctx_blocks)
-    if total_len < 400: # Minimum content length for "strong" context
-        return False
-    q_toks = set(t for t in _tokenize(question) if len(t) > 2) # Use tokens from question
-    sample = " ".join(md["text"] for md in ctx_blocks[:3]).lower() # Check first few chunks
-    hit = sum(1 for t in q_toks if t in sample)
-    return hit >= 2 # Require at least 2 keyword hits
+            session.permanent = True
+            set_tl_session(tl_name, tl_display_name)
+            return jsonify({"ok": True, "created": True})
+        else:
+            # Existing user - check PIN
+            if not tl_user.pin_hash:
+                # Set PIN if not set
+                tl_user.pin_hash = generate_password_hash(tl_pin)
+                db.commit()
 
-def _needs_bullets(ans: str) -> bool:
-    """True if answer ends with 'summary:' / 'including:' / 'types:' etc. and has no bullets."""
-    if not ans or not ans.strip():
-        return True
-    s = ans.strip()
-    # Only trigger if it's JUST a heading with no substantial content
-    if re.fullmatch(r"(?is)\s*[\w\s\-\(\)/&]+:\s*", s):
-        return True
-    # For brief responses, don't force bullets unless it's clearly incomplete
-    if len(s) > 50:
-        return False
-    # Only force bullets for very short responses that end with list indicators
-    cue = re.search(r"(?is)\b(summary|overview|including|includes|include|the following|as follows|list|types|services|features)\b\s*:?\s*$", s)
-    has_bullets = re.search(r"\n\s*(?:[-•*]|\d+\.)\s+", s) is not None
-    return bool(cue) and not has_bullets and len(s) < 30
+                session.permanent = True
+                set_tl_session(tl_name, tl_display_name)
+                return jsonify({"ok": True, "pin_set": True})
+            elif not check_password_hash(tl_user.pin_hash, tl_pin):
+                return jsonify({"ok": False, "reason": "bad_pin"}), 403
+            else:
+                # Successful login
+                session.permanent = True
+                set_tl_session(tl_name, tl_display_name)
+                return jsonify({"ok": True})
+    finally:
+        db.close()
 
-def _bulletize_with_llm(question: str, ctx_blocks: list, draft_heading: str = "") -> str:
-    client = OpenAI()
-    context = _build_context_from_docs(ctx_blocks) # Use the context builder
-    if not context: context = "No relevant project files found."
+@app.route('/api/reconcile/state')
+def api_reconcile_state():
+    """Get reconciliation state for TL"""
+    if not require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
 
-    heading = draft_heading.strip() if draft_heading else ""
-    system = ("Rewrite the answer as concise bullet points using ONLY the provided context. "
-              "Return 5–12 bullets. No preamble, no closing line.")
-    user = f"Question: {question}\n\nContext:\n{context}\n\n{('Heading: ' + heading) if heading else ''}\n\nWrite only bullet points:"
-    resp=client.chat.completions.create(model=AI_MODEL,
-                                        messages=[{"role":"system","content":system},{"role":"user","content":user}],
-                                        temperature=0.1, max_tokens=400)
-    return resp.choices[0].message.content.strip()
+    loc = (request.args.get("location") or "").strip()
+    wh = (request.args.get("warehouse") or "").strip()
+    line_code = (request.args.get("line_code") or "").strip()
 
-def _maybe_force_bullets(question: str, ctx_blocks: list, ans: str) -> str:
-    # Only force bullets for very incomplete responses
-    if not _needs_bullets(ans) or len(ans.strip()) > 100:
-        return ans
-    # bulletize using same context; if empty, still try general knowledge
-    bulletized = _bulletize_with_llm(question, ctx_blocks, draft_heading=ans)
-    if bulletized and not _needs_bullets(bulletized):
-        return bulletized
-    return _bulletize_with_llm(question, [], draft_heading=ans) or ans # Fallback to general knowledge bulleting
+    db = SessionLocal()
+    try:
+        line = db.query(Line).filter_by(location=loc, warehouse=wh, line_code=line_code).first()
+        if not line:
+            return jsonify({"ok": False, "reason": "not_configured"}), 404
 
-# ---------------- Bullet safety (avoid empty "summary:" endings) ----------------
-# (This function is kept but _needs_bullets and _bulletize_with_llm are used instead)
-def _is_nonanswer(text: str) -> bool:
-    if not text: return True
-    bad = [r"does not provide", r"not present in the context", r"based on the provided context.*cannot",
-           r"no project context found", r"i (?:do|don’t|don't) (?:have|see)", r"not specified in the context"]
-    t = text.strip().lower()
-    return any(re.search(p, t) for p in bad)
+        job = db.query(ScanJob).filter_by(line_id=line.id, status="open").order_by(ScanJob.id.desc()).first()
+        if not job:
+            job = ScanJob(line_id=line.id, status="open", opened_at=abu_dhabi_now())
+            db.add(job)
+            db.commit()
 
-def _llm_with_context(question: str, context: str, history_msgs: list) -> str:
-    """Use project context to answer with improved accuracy."""
-    client=OpenAI()
-    if not context: context = "No project context found."
+        scanned_total = db.query(func.coalesce(func.sum(Scan.qty), 0)).filter_by(job_id=job.id).scalar() or 0
+        asg = db.query(Assignment).filter_by(line_id=line.id).order_by(Assignment.id.desc()).first()
+        assigned = [asg.counter_name_1 if asg else "", asg.counter_name_2 if asg else ""]
 
-    # Create enhanced prompt with context
-    system_msg = """You are a DSV logistics assistant. Answer questions using ONLY the provided context from DSV's official documents.
+        return jsonify({
+            "ok": True,
+            "line_id": line.id,
+            "job_id": job.id,
+            "target_qty": int(line.target_qty or 0),
+            "scanned_total": int(scanned_total),
+            "assigned": assigned,
+            "status": job.status
+        })
+    finally:
+        db.close()
 
-CRITICAL INSTRUCTIONS:
-- Carefully read through ALL the provided context before answering
-- Use ONLY information explicitly stated in the provided context
-- If multiple sources contain relevant info, synthesize the complete answer
-- Quote specific rates, terms, and details exactly as written
-- If the answer is in the context but incomplete, provide what's available and note what's missing
+@app.route('/api/reconcile/edit_target', methods=['POST'])
+def api_reconcile_edit_target():
+    """Edit target quantity for TL"""
+    @after_this_request
+    def _nc(r):
+        return _no_cache(r)
 
-SEARCH STRATEGY:
-- Look for exact keywords and phrases from the question in the context
-- Check multiple document sources if available
-- Pay attention to different document types (rates, terms, VAS, etc.)
+    if not require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
 
-RESPONSE STYLE:
-- Be direct and factual but complete
-- Always include exact rates with units (AED/CBM/DAY, AED/SQM/MONTH, etc.)
-- Include specific details like minimums, duration-based pricing, conditions
-- Mention the source document when helpful for credibility
+    d = request.get_json(force=True)
+    line_id = int(d.get("line_id") or 0)
+    new_target = int(d.get("new_target") or 0)
 
-COMPANY INFO FROM CONTEXT:
-- Extract company details, services, fleet info directly from the provided documents
-- Include specific operational details found in the context
-- Reference facility locations, service types as mentioned in documents
+    if not line_id or new_target < 0:
+        return jsonify({"ok": False, "reason": "bad_input"}), 400
 
-If no relevant information is found in the context, clearly state "I don't see that specific information in the provided documents."
+    db = SessionLocal()
+    try:
+        line = db.get(Line, line_id)
+        if not line:
+            return jsonify({"ok": False, "reason": "not_found"}), 404
 
+        prev = int(line.target_qty or 0)
+        if new_target == prev:
+            return jsonify({"ok": False, "reason": "same_target"}), 400
+
+        line.target_qty = new_target
+        line.updated_at = abu_dhabi_now()
+        db.add(line)
+
+        # Get the open job for logging
+        job = db.query(ScanJob).filter_by(line_id=line_id, status="open").order_by(ScanJob.id.desc()).first()
+        if job:
+            tl_session = session.get(SESSION_TL_KEY, {})
+            tl_name = tl_session.get("display_name", "TL")
+            rec = Reconciliation(
+                job_id=job.id,
+                requested_by=tl_name,  # Add required field
+                reason=f"Target changed from {prev} to {new_target}",
+                previous_target=prev,
+                new_target=new_target,
+                result="edited_target",
+                approved_at=abu_dhabi_now(),
+                tl_approved_by=tl_name
+            )
+            db.add(rec)
+
+        # Add audit log
+        tl_session = session.get(SESSION_TL_KEY, {})
+        audit = AuditLog(
+            actor=tl_session.get("display_name", "TL"),
+            action='TARGET_UPDATED',
+            entity='LINE',
+            entity_id=line_id,
+            payload_json=json.dumps({"previous_target": prev, "new_target": new_target})
+        )
+        db.add(audit)
+
+        db.commit()
+        return jsonify({
+            "ok": True,
+            "target_qty": new_target,
+            "previous_target": prev,
+            "message": "Target updated successfully"
+        })
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/approve_variance', methods=['POST'])
+def api_reconcile_approve_variance():
+    """Approve variance for TL"""
+    @after_this_request
+    def _nc(r):
+        return _no_cache(r)
+
+    if not require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    d = request.get_json(force=True)
+    job_id = int(d.get("job_id") or 0)
+    note = (d.get("note") or "").strip()
+
+    db = SessionLocal()
+    try:
+        job = db.get(ScanJob, job_id)
+        if not job:
+            return jsonify({"ok": False, "reason": "not_found"}), 404
+
+        job.status = "variance_approved"
+        db.add(job)
+
+        tl_session = session.get(SESSION_TL_KEY, {})
+        tl_name = tl_session.get("display_name", "TL")
+        rec = Reconciliation(
+            job_id=job_id,
+            requested_by=tl_name,  # Add the required requested_by field
+            reason=note,
+            result="approved_variance",
+            approved_at=abu_dhabi_now(),
+            tl_approved_by=tl_name
+        )
+        db.add(rec)
+        db.commit()
+        return jsonify({"ok": True, "status": job.status})
+    finally:
+        db.close()
+
+@app.route('/api/lines')
+def api_lines():
     """
-    msgs=[{"role":"system","content":system_msg}]
-    for m in history_msgs[-MAX_TURNS:]:
-        msgs.append({"role": m["role"], "content": m["content"]})
-    msgs.append({"role":"system","content": f"DSV OFFICIAL DOCUMENTS CONTEXT:\n{context}"})
-    msgs.append({"role":"user","content": question})
+    Query params: location, warehouse
+    Returns configured lines for this LW with target & assigned counters.
+    For TL users, only return lines they manage.
+    """
+    @after_this_request
+    def _nc(r):
+        return _no_cache(r)
 
-    resp=client.chat.completions.create(model=AI_MODEL, messages=msgs, temperature=0.1, max_tokens=500)
-    ans = resp.choices[0].message.content.strip()
+    location = request.args.get('location', '').strip()
+    warehouse = request.args.get('warehouse', '').strip()
 
-    # Check if the answer is just a stub and try to bulletize if necessary
-    if _is_nonanswer(ans):
-        return ans
+    if not location or not warehouse:
+        return jsonify({'ok': False, 'reason': 'missing'}), 400
 
-    # Attempt to bulletize if it looks like a list heading without bullets
-    ans = _maybe_force_bullets(question, [], ans)
-
-    if TAG_SOURCES: ans = "[From files] " + ans
-    if AI_DEBUG and not context.startswith("No project context found."):
-        # Extract sources from context for AI_DEBUG
-        sources = re.findall(r"Source: ([^\n]+)", context)
-        if sources:
-            uniq_sources = list(dict.fromkeys(sources))[:5]
-            ans += "\n\n[Sources]\n" + "\n".join(uniq_sources)
-    return ans
-
-def _llm_general_answer(question: str, history_msgs: list) -> str:
-    """Plain ChatGPT fallback (no files)."""
-    client=OpenAI()
-    system_msg = """You are a DSV logistics assistant. Give brief, direct answers.
-
-RESPONSE STYLE:
-- Keep answers concise (1-3 sentences unless asked for details)
-- Lead with the most important information
-- No lengthy explanations unless specifically requested
-
-DSV SERVICES:
-- Global transport and logistics company
-- Road transport, air & sea freight, contract logistics
-- Large fleet: trucks, trailers, specialized vehicles
-- UAE operations: Dubai, Abu Dhabi facilities
-
-RATES (when applicable):
-- AC storage: 1.2-3.5 AED/CBM/DAY
-- Non-AC storage: 0.8-2.5 AED/CBM/DAY
-- Include minimums and duration-based pricing
-
-Keep responses brief unless user asks for more details."""
-
-    msgs=[{"role":"system","content":system_msg}]
-    for m in history_msgs[-MAX_TURNS:]:
-        msgs.append({"role": m["role"], "content": m["content"]})
-    msgs.append({"role":"user","content":question})
-    resp=client.chat.completions.create(model=AI_MODEL, messages=msgs, temperature=0.2, max_tokens=300)
-    ans = resp.choices[0].message.content.strip()
-    ans = _maybe_force_bullets(question, [], ans)
-    if TAG_SOURCES: ans = "[General knowledge] " + ans
-    return ans
-
-def _smart_answer(question: str, history_msgs: list) -> str:
-    """Search your files first with enhanced matching, fallback to ChatGPT."""
-    docs = _search_rag(question)
-
-    # If we found good matches, use them
-    if docs:
-        context = _build_context_from_docs(docs)
-        # Log more details for debugging
-        sources = [doc['path'] for doc in docs[:5]]  # Top 5 sources
-        log.info(f"Found {len(docs)} docs, context: {len(context)} chars")
-        log.info(f"Top sources: {sources}")
-        log.info(f"Question: {question[:100]}...")
-        return _llm_with_context(question, context, history_msgs)
-
-    # If no matches but query seems DSV-related, try broader search
-    dsv_related = any(keyword in question.lower() for keyword in
-                     ['dsv', 'storage', 'rate', 'warehouse', 'ac', 'chemical', 'rms', 'standard', 'terms'])
-
-    if dsv_related:
-        # Try a broader search with lower threshold
-        broader_docs = []
-        if RAG_VECTORS.shape[0] > 0:
-            client = OpenAI()
-            resp = client.embeddings.create(input=[question], model=EMB_MODEL)
-            q_emb = np.array(resp.data[0].embedding, dtype=np.float32)
-            scores = np.dot(RAG_VECTORS, q_emb)
-
-            # Lower threshold, prioritize chatbot folder
-            for i, meta in enumerate(RAG_META):
-                if 'chatbot' in meta['path'].lower():
-                    scores[i] += 0.4
-
-            top_ids = np.argsort(scores)[-8:][::-1]  # Get more results
-            broader_docs = [RAG_META[i] for i in top_ids if scores[i] > 0.05]
-
-        if broader_docs:
-            context = _build_context_from_docs(broader_docs)
-            log.info(f"Broader search found {len(broader_docs)} docs for DSV query")
-            return _llm_with_context(question, context, history_msgs)
-
-    log.info("No RAG matches, using general LLM")
-    return _llm_general_answer(question, history_msgs)
-
-# ---------------- Chat routes ----------------
-@app.route("/smart_chat", methods=["POST"])
-def smart_chat():
-    data = request.get_json(silent=True) or {}
-    message = (data.get("message") or "").strip()
-    cid = _get_cid()
-    if not message:
-        resp = make_response(jsonify({"reply": "Hi! Ask me anything about this project—files, templates, rates, or how it works."}))
-        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
-        return resp
+    db = SessionLocal()
     try:
-        _append_history(cid, "user", message)
-        reply = _smart_answer(message, _get_history(cid))
-        _append_history(cid, "assistant", reply)
-        resp = make_response(jsonify({"reply": reply}))
-        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
-        return resp
-    except Exception as e:
-        log.exception("smart_chat error")
-        resp = make_response(jsonify({"reply": f"Sorry, an error occurred ({type(e).__name__})."}), 200)
-        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
-        return resp
+        lines_query = db.query(Line).filter(
+            Line.location == location,
+            Line.warehouse == warehouse
+        )
 
-# Backward-compatible /chat (for legacy JS)
-@app.route("/chat", methods=["POST"])
-def chat():
-    data = request.get_json(silent=True) or {}
-    raw = (data.get("message") or "").strip()
-    cid = _get_cid()
-    if not raw:
-        resp = make_response(jsonify({"reply": "Hi! How can I help with DSV quotations today?"}))
-        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
-        return resp
+        # If TL is authenticated, filter by their lines only (except for managers)
+        tl_session = session.get(SESSION_TL_KEY)
+        is_manager = session.get('is_manager', False)
+
+        if tl_session and not is_manager:
+            tl_name = tl_session.get("display_name", "")
+            print(f"DEBUG: TL session found - {tl_name}, filtering lines")
+
+            # Get lines where this TL is assigned (case-insensitive comparison)
+            tl_line_ids = db.query(Assignment.line_id).filter(
+                func.lower(Assignment.tl_name) == func.lower(tl_name),
+                Assignment.active == True
+            ).subquery()
+            lines_query = lines_query.filter(Line.id.in_(tl_line_ids))
+        elif tl_session and is_manager:
+            print(f"DEBUG: Manager session found - showing all lines")
+        else:
+            print(f"DEBUG: No TL session found - showing no lines for regular users")
+            # For regular users without TL session, return empty list
+            lines_query = lines_query.filter(Line.id == -1)  # This will return no results
+
+        lines = lines_query.all()
+        print(f"DEBUG: Found {len(lines)} lines for location={location}, warehouse={warehouse}")
+
+        out = []
+        for line in lines:
+            assignment = db.query(Assignment).filter(
+                Assignment.line_id == line.id,
+                Assignment.active == True
+            ).first()
+
+            assigned = []
+            tl_name_for_line = "Unknown"
+            if assignment:
+                # Filter out empty or None values and include both counters
+                assigned = [name for name in [assignment.counter_name_1, assignment.counter_name_2] if name and name.strip()]
+                tl_name_for_line = assignment.tl_name
+
+            print(f"DEBUG: Line {line.line_code} managed by {tl_name_for_line}, assigned to: {assigned}")
+
+            out.append({
+                'line_id': line.id,
+                'line_code': line.line_code,
+                'target_qty': line.target_qty,
+                'assigned': assigned
+            })
+
+        return jsonify({'ok': True, 'lines': out})
+
+    finally:
+        db.close()
+
+@app.route('/api/line/upsert', methods=['POST'])
+def api_line_upsert():
+    """Create/update line with target and counter assignments"""
+
+    data = request.get_json()
+    location = data.get('location')
+    warehouse = data.get('warehouse')
+    line_code = data.get('line_code')
+    target_qty = data.get('target_qty')
+    counter1 = data.get('counter1')
+    counter2 = data.get('counter2')
+    tl_name = data.get('tl_name')
+    pin = data.get('pin')
+
+    if not all([location, warehouse, line_code, target_qty, counter1, counter2, tl_name, pin]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    db = SessionLocal()
     try:
-        _append_history(cid, "user", raw)
-        reply = _smart_answer(raw, _get_history(cid))
-        _append_history(cid, "assistant", reply)
-        resp = make_response(jsonify({"reply": reply}))
-        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
-        return resp
+        # Find or create line
+        line = db.query(Line).filter(
+            Line.location == location,
+            Line.warehouse == warehouse,
+            Line.line_code == line_code
+        ).first()
+
+        _, tl_norm = _session_user()
+
+        if line:
+            line.target_qty = target_qty
+            line.updated_at = abu_dhabi_now()
+        else:
+            line = Line(
+                location=location,
+                warehouse=warehouse,
+                line_code=line_code,
+                target_qty=target_qty,
+                created_by_tl_norm=tl_norm
+            )
+            db.add(line)
+            db.flush()
+
+        # Deactivate old assignments
+        db.query(Assignment).filter(Assignment.line_id == line.id).update({'active': False})
+
+        # Create new assignment
+        assignment = Assignment(
+            line_id=line.id,
+            counter_name_1=counter1,
+            counter_name_2=counter2,
+            tl_name=tl_name,
+            tl_pin_hash=hash_pin(pin),
+            active=True
+        )
+        db.add(assignment)
+
+        # Ensure one open job exists
+        open_job = db.query(ScanJob).filter(
+            ScanJob.line_id == line.id,
+            ScanJob.status == 'open'
+        ).first()
+
+        if not open_job:
+            job = ScanJob(
+                line_id=line.id,
+                status='open',
+                opened_by=tl_name,
+                opened_at=abu_dhabi_now() # Updated here
+            )
+            db.add(job)
+
+        # Audit log
+        audit = AuditLog(
+            actor=tl_name,
+            action='LINE_SETUP',
+            entity='LINE',
+            entity_id=line.id,
+            payload_json=json.dumps(data)
+        )
+        db.add(audit)
+
+        db.commit()
+
+        # Return fresh state
+        return jsonify({
+            'ok': True,
+            'line_id': line.id,
+            'line_code': line.line_code,
+            'target_qty': line.target_qty,
+            'assigned': [counter1, counter2]
+        })
+
     except Exception as e:
-        log.exception("chat error")
-        resp = make_response(jsonify({"reply": f"Sorry, an error occurred ({type(e).__name__})."}), 200)
-        resp.set_cookie("cid", cid, httponly=True, samesite="Lax")
-        return resp
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
 
-# Manual reindex when you add/replace files
-@app.route("/reindex", methods=["POST"])
-def reindex():
-    try: os.remove(RAG_INDEX_PATH)
-    except FileNotFoundError: pass
-    try: os.remove(RAG_META_PATH)
-    except FileNotFoundError: pass
-    global RAG_VECTORS, RAG_META
-    RAG_VECTORS = np.zeros((0,1536),dtype=np.float32); RAG_META = []
-    _ensure_index()
-    return jsonify({"ok": True, "chunks": int(RAG_VECTORS.shape[0]), "paths": len({m['path'] for m in RAG_META})})
+@app.route('/api/job/state')
+def api_job_state():
+    """Get current job state for a line"""
+    location = request.args.get('location', '').strip()
+    warehouse = request.args.get('warehouse', '').strip()
+    line_code = request.args.get('line_code', '').strip()
+    counter = request.args.get('counter', '').strip()
 
-# ===== Build index at startup =====
-_ensure_index()
+    if not all([location, warehouse, line_code]):
+        return jsonify({'ok': False, 'reason': 'missing_params'}), 400
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    db = SessionLocal()
+    try:
+        line = db.query(Line).filter(
+            Line.location == location,
+            Line.warehouse == warehouse,
+            Line.line_code == line_code
+        ).first()
+
+        if not line:
+            return jsonify({'ok': False, 'reason': 'not_configured'}), 404
+
+        assignment = db.query(Assignment).filter(
+            Assignment.line_id == line.id,
+            Assignment.active == True
+        ).first()
+
+        assigned = []
+        is_assigned = False
+        if assignment:
+            assigned = [assignment.counter_name_1, assignment.counter_name_2]
+            # Normalize counter names for comparison (case-insensitive)
+            counter_norm = _norm(counter)
+            is_assigned = counter_norm in {_norm(name) for name in assigned if name}
+
+        # Get current job (including locked ones)
+        current_job = db.query(ScanJob).filter(
+            ScanJob.line_id == line.id,
+            ScanJob.status.in_(['open', 'locked_recon', 'variance_approved'])
+        ).first()
+
+        # Check if there are completed jobs
+        completed_jobs = db.query(ScanJob).filter(
+            ScanJob.line_id == line.id,
+            ScanJob.status == 'submitted'
+        ).count()
+
+        # If there are completed jobs and no current jobs, the line is completed
+        if completed_jobs > 0 and not current_job:
+            return jsonify({
+                'ok': False,
+                'reason': 'line_completed',
+                'message': 'This line has been completed. Contact your Team Leader for a new assignment.'
+            }), 410
+
+        # If no current job exists and no completed jobs, create a new open job
+        if not current_job:
+            current_job = ScanJob(
+                line_id=line.id,
+                status='open',
+                opened_at=abu_dhabi_now()
+            )
+            db.add(current_job)
+            db.commit()
+
+        # Count scanned total using sum of qty
+        scanned_total = db.query(func.coalesce(func.sum(Scan.qty), 0)).filter(Scan.job_id == current_job.id).scalar() or 0
+
+        return jsonify({
+            'ok': True,
+            'line_id': line.id,
+            'job_id': current_job.id,
+            'target': int(line.target_qty or 0),
+            'target_qty': int(line.target_qty or 0),
+            'assigned': assigned,
+            'is_assigned': bool(is_assigned),
+            'scanned_total': int(scanned_total),
+            'status': current_job.status
+        })
+
+    finally:
+        db.close()
+
+def _ns(s):
+    """Normalize string for scan comparison"""
+    import re
+    return re.sub(r"[^A-Za-z0-9\-_]", "", (s or "").strip()).upper()
+
+@app.route('/api/scan/add', methods=['POST'])
+def api_scan_add():
+    """Add a scan to the job with strict duplicate checking"""
+    data = request.get_json(force=True)
+    job_id = int(data.get("job_id") or 0)
+    line_id = int(data.get("line_id") or 0)
+    counter_name = (data.get("counter_name") or "").strip()
+    sku_raw = (data.get("sku") or "").strip()
+    code_raw = (data.get("serial_or_code") or "").strip()
+    qty = int(data.get("qty") or 1)
+    source = (data.get("source") or "manual").strip()
+
+    if not (job_id and line_id and counter_name and code_raw and qty >= 1):
+        return jsonify({"ok": False, "reason": "missing"}), 400
+
+    sku = _ns(sku_raw)
+    code = _ns(code_raw)
+
+    db = SessionLocal()
+    try:
+        # Strict duplicate check: same (job_id, sku, serial_code) combination only
+        existing = db.query(Scan.id).filter(
+            Scan.job_id == job_id,
+            Scan.sku == sku,
+            Scan.serial_code == code
+        ).first()
+
+        if existing:
+            return jsonify({"ok": False, "duplicate": True}), 409
+
+        # Add scan
+        scan = Scan(
+            job_id=job_id,
+            line_id=line_id,
+            counter_name=counter_name,
+            sku=sku,
+            serial_code=code,
+            qty=qty,
+            source=source,
+            created_at=abu_dhabi_now()
+        )
+        db.add(scan)
+        db.commit()
+
+        # Get updated total count
+        scanned_total = db.query(func.coalesce(func.sum(Scan.qty), 0)).filter(Scan.job_id == job_id).scalar() or 0
+
+        return jsonify({"ok": True, "scanned_total": int(scanned_total)})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({'ok': False, 'error': 'Failed to add item'}), 500
+    finally:
+        db.close()
+
+@app.route('/api/submit/final', methods=['POST'])
+def api_submit_final():
+    """Finalize and submit job - only when variance approved or total matches target"""
+    data = request.get_json()
+    job_id = data.get('job_id')
+    counter_name = data.get('counter_name')
+
+    db = SessionLocal()
+    try:
+        job = db.query(ScanJob).filter(ScanJob.id == job_id).first()
+        if not job:
+            return jsonify({'ok': False, 'error': 'Job not found'}), 404
+
+        line = job.line
+        scanned_total = db.query(func.coalesce(func.sum(Scan.qty), 0)).filter(Scan.job_id == job_id).scalar() or 0
+
+        # Check if submission allowed
+        allow = (job.status == "variance_approved") or (scanned_total == int(line.target_qty or 0))
+        if not allow:
+            return jsonify({"ok": False, "reason": "mismatch"}), 412
+
+        # Get all scans for export
+        scans = db.query(Scan).filter(Scan.job_id == job_id).all()
+
+        # Export to Excel
+        with FileLock(LOCK_PATH, timeout=10):
+            wb = load_workbook(MDF_PATH)
+            ws = wb.active
+
+            for scan in scans:
+                now = scan.created_at
+                row = [
+                    now.strftime("%Y-%m-%d"),  # Date
+                    now.strftime("%H:%M:%S"),  # Time
+                    line.location,             # Location
+                    line.warehouse,            # Warehouse
+                    scan.counter_name,         # CounterName
+                    scan.sku or '',            # SKU
+                    scan.serial_code,          # SerialOrCode
+                    scan.qty,                  # QTY
+                    scan.source                # Source
+                ]
+                ws.append(row)
+
+            wb.save(MDF_PATH)
+            wb.close()
+
+        # Close job
+        job.status = 'submitted'
+        job.closed_at = abu_dhabi_now()
+
+        # Audit log
+        audit = AuditLog(
+            actor=counter_name or 'Unknown',
+            action='JOB_SUBMIT',
+            entity='SCANJOB',
+            entity_id=job_id,
+            payload_json=json.dumps({'scanned_total': scanned_total, 'target': line.target_qty})
+        )
+        db.add(audit)
+
+        db.commit()
+
+        return jsonify({'ok': True, 'submitted': True})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/request', methods=['POST'])
+def api_reconcile_request():
+    """Request reconciliation and lock job until TL acts"""
+    data = request.get_json(force=True)
+    job_id = int(data.get("job_id") or 0)
+    line_id = int(data.get("line_id") or 0)
+    counter_name = (data.get("counter_name") or "").strip()
+    reason = (data.get("reason") or "").strip()
+
+    if not (job_id and line_id and counter_name):
+        return jsonify({"ok": False, "reason": "missing"}), 400
+
+    db = SessionLocal()
+    try:
+        job = db.get(ScanJob, job_id)
+        line = db.get(Line, line_id)
+        if not job or not line:
+            return jsonify({"ok": False, "reason": "not_found"}), 404
+
+        # Get current scanned total
+        scanned_total = db.query(func.coalesce(func.sum(Scan.qty), 0)).filter_by(job_id=job_id).scalar() or 0
+        target = int(line.target_qty or 0)
+
+        # Check if reconciliation needed
+        if scanned_total == target:
+            return jsonify({"ok": False, "reason": "no_mismatch"}), 400
+
+        # Get TL name from assignment
+        asg = db.query(Assignment).filter_by(line_id=line_id, active=True).order_by(Assignment.id.desc()).first()
+        tl_name_norm = _norm(asg.tl_name) if asg and getattr(asg, "tl_name", None) else ""
+
+        # Create reconciliation request
+        req = ReconciliationRequest(
+            line_id=line_id,
+            job_id=job_id,
+            tl_name_norm=tl_name_norm,
+            requested_by=counter_name,
+            reason=reason,
+            requested_qty=int(scanned_total),
+            status='pending'
+        )
+
+        # Lock job until TL acts
+        job.status = "locked_recon"
+
+        db.add(req)
+        db.add(job)
+        db.commit()
+
+        return jsonify({"ok": True, "requested_qty": int(scanned_total)})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/approve', methods=['POST'])
+def api_reconcile_approve():
+    """TL approve reconciliation"""
+    if not session.get('tl_authenticated'):
+        return jsonify({'error': 'TL authentication required'}), 401
+
+    data = request.get_json()
+    job_id = data.get('job_id')
+    mode = data.get('mode')  # edit_target or approve_variance
+    new_target = data.get('new_target')
+    note = data.get('note')
+
+    db = SessionLocal()
+    try:
+        job = db.query(ScanJob).filter(ScanJob.id == job_id).first()
+        if not job:
+            return jsonify({'error': 'Job not found'}), 404
+
+        reconciliation = db.query(Reconciliation).filter(
+            Reconciliation.job_id == job_id
+        ).order_by(Reconciliation.id.desc()).first()
+
+        if mode == 'edit_target' and new_target:
+            job.line.target_qty = new_target
+            job.line.updated_at = abu_dhabi_now()
+            reconciliation.result = 'edited_target'
+            reconciliation.new_target = new_target
+        elif mode == 'approve_variance':
+            job.status = 'variance_approved'
+            reconciliation.result = 'approved_variance'
+
+        reconciliation.tl_approved_by = session.get('tl_name') # This should also be updated to display_name if used
+        reconciliation.approved_at = abu_dhabi_now()
+        reconciliation.note = note
+
+        db.commit()
+        return jsonify({'success': True})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/recent-scans')
+def api_recent_scans():
+    """Get recent scans for a job"""
+    job_id = request.args.get('job_id')
+    if not job_id:
+        return jsonify([])
+
+    db = SessionLocal()
+    try:
+        scans = db.query(Scan).filter(
+            Scan.job_id == job_id
+        ).order_by(Scan.created_at.desc()).limit(10).all()
+
+        scan_data = []
+        for scan in scans:
+            scan_data.append({
+                'sku': scan.sku or '',
+                'serial_code': scan.serial_code,
+                'qty': scan.qty,
+                'counter_name': scan.counter_name,
+                'source': scan.source,
+                'time': scan.created_at.strftime('%H:%M:%S')
+            })
+
+        return jsonify(scan_data)
+
+    finally:
+        db.close()
+
+@app.route('/exports/MDF.xlsx')
+def download_excel():
+    """Download the Excel file with all completed job data"""
+    db = SessionLocal()
+    try:
+        # Get only submitted jobs from database (not variance_approved)
+        jobs = db.query(ScanJob).filter(
+            ScanJob.status == 'submitted'
+        ).all()
+
+        # Regenerate Excel file with current data
+        with FileLock(LOCK_PATH, timeout=10):
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Sheet1"
+            ws.append(COLUMNS)
+
+            # Add all scans from completed jobs
+            for job in jobs:
+                scans = db.query(Scan).filter(Scan.job_id == job.id).all()
+                for scan in scans:
+                    now = scan.created_at # This will be in Abu Dhabi time
+                    row = [
+                        now.strftime("%Y-%m-%d"),  # Date
+                        now.strftime("%H:%M:%S"),  # Time
+                        job.line.location,         # Location
+                        job.line.warehouse,        # Warehouse
+                        scan.counter_name,         # CounterName
+                        scan.sku or '',            # SKU
+                        scan.serial_code,          # SerialOrCode
+                        scan.qty,                  # QTY
+                        scan.source                # Source
+                    ]
+                    ws.append(row)
+
+            wb.save(MDF_PATH)
+            wb.close()
+
+        return send_file(MDF_PATH, as_attachment=True, download_name='MDF.xlsx')
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/tl_queue')
+def api_tl_reconcile_queue():
+    """Get pending reconciliation requests for TL"""
+    if not require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    tl_session = session.get(SESSION_TL_KEY, {})
+    tl_name = tl_session.get("display_name", "")
+
+    db = SessionLocal()
+    try:
+        # Get TL's lines using case-insensitive comparison
+        assignments = db.query(Assignment).filter(
+            func.lower(Assignment.tl_name) == func.lower(tl_name),
+            Assignment.active == True
+        ).all()
+
+        line_ids = [a.line_id for a in assignments]
+
+        if not line_ids:
+            return jsonify({"ok": True, "requests": []})
+
+        # Get pending reconciliation requests for TL's lines
+        requests = db.query(ReconciliationQueue).filter(
+            ReconciliationQueue.line_id.in_(line_ids),
+            ReconciliationQueue.status == 'pending'
+        ).order_by(ReconciliationQueue.created_at.desc()).all()
+
+        queue_data = []
+        for req in requests:
+            queue_data.append({
+                'id': req.id,
+                'job_id': req.job_id,
+                'line_code': req.line.line_code,
+                'location': req.line.location,
+                'warehouse': req.line.warehouse,
+                'requested_by': req.requested_by,
+                'reason': req.reason,
+                'scanned_total': req.scanned_total,
+                'target_qty': req.target_qty,
+                'created_at': req.created_at.strftime('%H:%M:%S')
+            })
+
+        return jsonify({"ok": True, "requests": queue_data})
+
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/notification_count')
+def api_reconcile_notification_count():
+    """Get count of pending reconciliation requests for TL"""
+    if not require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    tl_session = session.get(SESSION_TL_KEY, {})
+    tl_name = tl_session.get("display_name", "")
+
+    db = SessionLocal()
+    try:
+        # Get TL's lines using case-insensitive comparison
+        assignments = db.query(Assignment).filter(
+            func.lower(Assignment.tl_name) == func.lower(tl_name),
+            Assignment.active == True
+        ).all()
+
+        line_ids = [a.line_id for a in assignments]
+
+        if not line_ids:
+            return jsonify({"ok": True, "count": 0})
+
+        # Count pending reconciliation requests for TL's lines
+        count = db.query(ReconciliationQueue).filter(
+            ReconciliationQueue.line_id.in_(line_ids),
+            ReconciliationQueue.status == 'pending'
+        ).count()
+
+        return jsonify({"ok": True, "count": count})
+
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/pending_count_all')
+def api_reconcile_pending_count_all():
+    """Get count of all pending reconciliation requests (no TL auth required)"""
+    db = SessionLocal()
+    try:
+        # Count all pending reconciliation requests
+        count = db.query(ReconciliationQueue).filter(
+            ReconciliationQueue.status == 'pending'
+        ).count()
+
+        return jsonify({"ok": True, "count": count})
+
+    finally:
+        db.close()
+
+
+
+@app.route('/api/reconcile/tl_respond', methods=['POST'])
+def api_tl_respond_reconcile():
+    """TL responds to reconciliation request"""
+    if not require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    data = request.get_json()
+    queue_id = data.get('queue_id')
+    action = data.get('action')  # 'approve_variance' or 'edit_target'
+    new_target = data.get('new_target')
+    note = data.get('note', '')
+
+    db = SessionLocal()
+    try:
+        queue_item = db.query(ReconciliationQueue).filter(ReconciliationQueue.id == queue_id).first()
+        if not queue_item:
+            return jsonify({'error': 'Request not found'}), 404
+
+        tl_session = session.get(SESSION_TL_KEY, {})
+        tl_name = tl_session.get("display_name", "TL")
+
+        if action == 'edit_target' and new_target:
+            # Update target quantity
+            line = queue_item.line
+            old_target = line.target_qty
+            line.target_qty = new_target
+            line.updated_at = abu_dhabi_now()
+
+            queue_item.status = 'approved'
+            queue_item.tl_response = f"Target updated from {old_target} to {new_target}. {note}"
+            queue_item.resolved_at = abu_dhabi_now()
+
+        elif action == 'approve_variance':
+            # Approve variance - update job status
+            job = queue_item.job
+            job.status = 'variance_approved'
+
+            queue_item.status = 'approved'
+            queue_item.tl_response = f"Variance approved. {note}"
+            queue_item.resolved_at = abu_dhabi_now()
+
+        # Add reconciliation record
+        reconciliation = Reconciliation(
+            job_id=queue_item.job_id,
+            requested_by=queue_item.requested_by,
+            reason=queue_item.reason,
+            previous_target=queue_item.target_qty,
+            new_target=new_target if action == 'edit_target' else queue_item.target_qty,
+            result=action,
+            approved_at=abu_dhabi_now(),
+            tl_approved_by=tl_name,
+            note=note
+        )
+        db.add(reconciliation)
+
+        db.commit()
+        return jsonify({'success': True})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/check_response')
+def api_check_reconcile_response():
+    """Check if counter's reconciliation request has been responded to"""
+    job_id = request.args.get('job_id')
+    if not job_id:
+        return jsonify({'error': 'Missing job_id'}), 400
+
+    db = SessionLocal()
+    try:
+        # Check if there's a resolved request for this job that hasn't been acknowledged yet
+        resolved_request = db.query(ReconciliationQueue).filter(
+            ReconciliationQueue.job_id == job_id,
+            ReconciliationQueue.status == 'approved',
+            ReconciliationQueue.acknowledged == False
+        ).order_by(ReconciliationQueue.resolved_at.desc()).first()
+
+        if resolved_request:
+            return jsonify({
+                'resolved': True,
+                'response': resolved_request.tl_response,
+                'resolved_at': resolved_request.resolved_at.strftime('%H:%M:%S'),
+                'acknowledged': False
+            })
+        else:
+            return jsonify({'resolved': False})
+
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/acknowledge', methods=['POST'])
+def api_reconcile_acknowledge():
+    """Acknowledge TL response to reconciliation request"""
+    data = request.get_json()
+    job_id = data.get('job_id')
+
+    if not job_id:
+        return jsonify({'error': 'Missing job_id'}), 400
+
+    db = SessionLocal()
+    try:
+        # Find the resolved request and mark it as acknowledged
+        resolved_request = db.query(ReconciliationQueue).filter(
+            ReconciliationQueue.job_id == job_id,
+            ReconciliationQueue.status == 'approved',
+            ReconciliationQueue.acknowledged == False
+        ).first()
+
+        if resolved_request:
+            resolved_request.acknowledged = True
+            db.commit()
+            return jsonify({'success': True, 'acknowledged': True})
+        else:
+            return jsonify({'success': True, 'message': 'No pending response to acknowledge'})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/logs/delete/<int:job_index>', methods=['DELETE'])
+def api_delete_log(job_index):
+    """Delete a specific log entry (database or historical)"""
+    if not require_tl():
+        return jsonify({"error": "TL authentication required"}), 401
+
+    data = request.get_json() or {}
+    passcode = data.get('passcode', '')
+
+    # Verify passcode for historical log deletion
+    if passcode != '240986':
+        return jsonify({"error": "Invalid passcode"}), 403
+
+    db = SessionLocal()
+    try:
+        # Get all completed jobs from database
+        db_jobs = db.query(ScanJob).filter(
+            ScanJob.status.in_(['submitted', 'variance_approved'])
+        ).order_by(ScanJob.closed_at.desc()).all()
+
+        # Get historical jobs from Excel
+        historical_jobs = []
+        try:
+            if os.path.exists(MDF_PATH):
+                df = pd.read_excel(MDF_PATH)
+                if not df.empty and len(df) > 0:
+                    # Group by date, location, warehouse, and first counter name to identify unique jobs
+                    historical_groups = df.groupby(['Date', 'Location', 'Warehouse', 'CounterName']).agg({
+                        'QTY': 'sum',
+                        'SerialOrCode': 'count',
+                        'Time': 'max'
+                    }).reset_index()
+
+                    for _, row in historical_groups.iterrows():
+                        try:
+                            date_str = str(row['Date'])
+                            time_str = str(row['Time'])
+                            if 'T' in date_str:
+                                closed_at = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                            else:
+                                datetime_str = f"{date_str} {time_str}"
+                                closed_at = datetime.strptime(datetime_str, '%Y-%m-%d %H:%M:%S')
+                        except:
+                            closed_at = abu_dhabi_now()
+
+                        historical_jobs.append({
+                            'date': str(row['Date']),
+                            'location': row['Location'],
+                            'warehouse': row['Warehouse'],
+                            'counter': row['CounterName'],
+                            'closed_at': closed_at,
+                            'source': 'excel'
+                        })
+        except Exception as e:
+            print(f"Error reading historical data: {e}")
+
+        # Sort all jobs by closed_at (newest first)
+        all_jobs = []
+
+        # Add database jobs
+        for job in db_jobs:
+            all_jobs.append({
+                'type': 'database',
+                'job': job,
+                'closed_at': job.closed_at,
+                'source': 'database'
+            })
+
+        # Add historical jobs
+        for hist_job in historical_jobs:
+            all_jobs.append({
+                'type': 'historical',
+                'job': hist_job,
+                'closed_at': hist_job['closed_at'],
+                'source': 'excel'
+            })
+
+        # Sort by closed_at (newest first)
+        all_jobs.sort(key=lambda x: x['closed_at'], reverse=True)
+
+        if job_index >= len(all_jobs):
+            return jsonify({"error": "Job not found"}), 404
+
+        job_to_delete = all_jobs[job_index]
+
+        if job_to_delete['type'] == 'database':
+            # Delete database job
+            job = job_to_delete['job']
+
+            # Delete related scans first
+            db.query(Scan).filter(Scan.job_id == job.id).delete()
+            # Delete related reconciliations
+            db.query(Reconciliation).filter(Reconciliation.job_id == job.id).delete()
+            # Delete related reconciliation queue items
+            db.query(ReconciliationQueue).filter(ReconciliationQueue.job_id == job.id).delete()
+            # Delete the job
+            db.delete(job)
+
+            # Add audit log
+            tl_session = session.get(SESSION_TL_KEY, {})
+            audit = AuditLog(
+                actor=tl_session.get("display_name", "TL"),
+                action='LOG_DELETE',
+                entity='SCANJOB',
+                entity_id=job.id,
+                payload_json=json.dumps({"line_code": job.line.line_code, "type": "database"})
+            )
+            db.add(audit)
+            db.commit()
+
+        elif job_to_delete['type'] == 'historical':
+            # Delete historical job from Excel
+            hist_job = job_to_delete['job']
+
+            with FileLock(LOCK_PATH, timeout=10):
+                df = pd.read_excel(MDF_PATH)
+
+                # Remove rows matching this historical job
+                mask = (
+                    (df['Date'].astype(str) == hist_job['date']) &
+                    (df['Location'] == hist_job['location']) &
+                    (df['Warehouse'] == hist_job['warehouse']) &
+                    (df['CounterName'] == hist_job['counter'])
+                )
+
+                df_filtered = df[~mask]
+
+                # Save back to Excel
+                from openpyxl import Workbook
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Sheet1"
+
+                # Add headers
+                ws.append(COLUMNS)
+
+                # Add remaining data
+                for _, row in df_filtered.iterrows():
+                    ws.append([
+                        row['Date'], row['Time'], row['Location'], row['Warehouse'],
+                        row['CounterName'], row['SKU'], row['SerialOrCode'],
+                        row['QTY'], row['Source']
+                    ])
+
+                wb.save(MDF_PATH)
+                wb.close()
+
+            # Add audit log
+            tl_session = session.get(SESSION_TL_KEY, {})
+            audit = AuditLog(
+                actor=tl_session.get("display_name", "TL"),
+                action='HISTORICAL_LOG_DELETE',
+                entity='EXCEL',
+                payload_json=json.dumps({
+                    "date": hist_job['date'],
+                    "location": hist_job['location'],
+                    "warehouse": hist_job['warehouse'],
+                    "counter": hist_job['counter'],
+                    "type": "historical"
+                })
+            )
+            db.add(audit)
+            db.commit()
+
+        return jsonify({"success": True})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/job/reset', methods=['POST'])
+def api_job_reset():
+    """Reset job to open status with passcode"""
+    data = request.get_json(force=True)
+    job_id = int(data.get("job_id") or 0)
+    passcode = (data.get("passcode") or "").strip()
+
+    if passcode != "240986":
+        return jsonify({"ok": False, "reason": "bad_passcode"}), 403
+
+    db = SessionLocal()
+    try:
+        job = db.get(ScanJob, job_id)
+        if not job:
+            return jsonify({"ok": False, "reason": "not_found"}), 404
+
+        job.status = "open"
+        db.add(job)
+        db.commit()
+
+        return jsonify({"ok": True})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/lines/inline_reconcile', methods=['POST'])
+def api_lines_inline_reconcile():
+    """Inline approve/edit from Line Management"""
+    if not require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    data = request.get_json(force=True)
+    req_id = int(data.get("request_id") or 0)
+    new_target = data.get("new_target", None)
+
+    db = SessionLocal()
+    try:
+        req = db.get(ReconciliationRequest, req_id)
+        if not req or req.status != "pending":
+            return jsonify({"ok": False, "reason": "not_found_or_done"}), 404
+
+        job = db.get(ScanJob, req.job_id)
+        line = db.get(Line, req.line_id)
+        if not job or not line:
+            return jsonify({"ok": False, "reason": "not_found"}), 404
+
+        # Set target based on action
+        tgt = int(new_target) if new_target is not None else int(req.requested_qty or 0)
+        line.target_qty = tgt
+        line.updated_at = abu_dhabi_now()
+
+        # Unlock job and allow submit
+        job.status = "variance_approved"
+        req.status = "approved"
+        req.resolved_at = abu_dhabi_now()
+
+        tl_session = session.get(SESSION_TL_KEY, {})
+        req.resolved_by = tl_session.get("display_name", "TL")
+
+        db.add(line)
+        db.add(job)
+        db.add(req)
+        db.commit()
+
+        return jsonify({"ok": True, "target_qty": tgt, "job_status": job.status})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/line/reset', methods=['POST'])
+def api_line_reset():
+    """Reset a completed line to create a new job (TL only)"""
+    if not _require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    data = request.get_json()
+    line_id = data.get('line_id')
+    passcode = data.get('passcode')
+
+    if not all([line_id, passcode]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    # Verify passcode
+    if passcode != '240986':
+        return jsonify({'error': 'Invalid passcode'}), 403
+
+    db = SessionLocal()
+    try:
+        line = db.get(Line, line_id)
+        if not line:
+            return jsonify({'error': 'Line not found'}), 404
+
+        # Verify TL permissions
+        display_name, tl_norm = _session_user()
+        is_manager = _is_manager()
+
+        if not is_manager:
+            # Check if TL created this line
+            if line.created_by_tl_norm != tl_norm:
+                return jsonify({'error': 'You can only reset lines you created'}), 403
+
+        # Check if there's already an open job
+        open_job = db.query(ScanJob).filter(
+            ScanJob.line_id == line.id,
+            ScanJob.status == 'open'
+        ).first()
+
+        if open_job:
+            return jsonify({'error': 'Line already has an open job'}), 400
+
+        # Create new open job
+        new_job = ScanJob(
+            line_id=line.id,
+            status='open',
+            opened_at=abu_dhabi_now(),
+            opened_by=display_name
+        )
+        db.add(new_job)
+
+        # Add audit log
+        audit = AuditLog(
+            actor=display_name,
+            action='LINE_RESET',
+            entity='LINE',
+            entity_id=line.id,
+            payload_json=json.dumps({
+                'location': line.location,
+                'warehouse': line.warehouse,
+                'line_code': line.line_code
+            })
+        )
+        db.add(audit)
+
+        db.commit()
+        return jsonify({'ok': True, 'message': 'Line reset successfully. Counters can now start counting again.'})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/counter/jobs')
+def api_counter_jobs():
+    """Get jobs for a specific counter - only non-submitted jobs"""
+    counter = request.args.get('counter', '').strip()
+
+    if not counter:
+        return jsonify({"ok": False, "reason": "missing_counter"}), 400
+
+    db = SessionLocal()
+    try:
+        cnorm = counter.strip().casefold()
+
+        # Get jobs that are not submitted
+        rows = db.query(ScanJob, Line, Assignment).join(
+            Line, Line.id == ScanJob.line_id
+        ).outerjoin(
+            Assignment, Assignment.line_id == Line.id
+        ).filter(
+            ScanJob.status.in_(["open", "locked_recon", "variance_approved"]),  # not submitted
+            Assignment.active == True
+        ).all()
+
+        items = []
+        for job, line, asg in rows:
+            if not asg:
+                continue
+            a1 = (getattr(asg, "counter_name_1", "") or "").strip().casefold()
+            a2 = (getattr(asg, "counter_name_2", "") or "").strip().casefold()
+            if cnorm in {a1, a2}:
+                items.append({
+                    "job_id": job.id,
+                    "line_id": line.id,
+                    "location": line.location,
+                    "warehouse": line.warehouse,
+                    "line_code": line.line_code,
+                    "target_qty": int(line.target_qty or 0),
+                    "status": job.status
+                })
+
+        return jsonify({"ok": True, "items": items})
+
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/inbox')
+def api_reconcile_inbox():
+    """Get pending reconciliation requests for TL"""
+    if not _require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    _, tl_norm = _session_user()
+
+    db = SessionLocal()
+    try:
+        # Get pending reconciliation requests for this TL
+        requests = db.query(ReconciliationRequest).filter(
+            ReconciliationRequest.tl_name_norm == tl_norm,
+            ReconciliationRequest.status == 'pending'
+        ).order_by(ReconciliationRequest.created_at.desc()).all()
+
+        inbox_data = []
+        for req in requests:
+            inbox_data.append({
+                'request_id': req.id,
+                'job_id': req.job_id,
+                'line_code': req.line.line_code,
+                'location': req.line.location,
+                'warehouse': req.line.warehouse,
+                'requested_by': req.requested_by,
+                'requested_qty': req.requested_qty,
+                'target_qty': req.line.target_qty,
+                'created_at': req.created_at.strftime('%H:%M:%S')
+            })
+
+        return jsonify({"ok": True, "requests": inbox_data})
+
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/resolve', methods=['POST'])
+def api_reconcile_resolve():
+    """TL resolves reconciliation request and unlocks job"""
+    if not _require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    data = request.get_json(force=True)
+    request_id = int(data.get("request_id") or 0)
+    action = data.get("action", "approve_variance")
+    new_target = data.get("new_target", None)
+
+    db = SessionLocal()
+    try:
+        req = db.get(ReconciliationRequest, request_id)
+        if not req or req.status != "pending":
+            return jsonify({"ok": False, "reason": "not_found_or_done"}), 404
+
+        job = db.get(ScanJob, req.job_id)
+        line = db.get(Line, req.line_id)
+        if not job or not line:
+            return jsonify({"ok": False, "reason": "not_found"}), 404
+
+        # Set target based on action
+        if action == "edit_target" and new_target is not None:
+            line.target_qty = int(new_target)
+        elif req.requested_qty is not None:
+            line.target_qty = req.requested_qty
+
+        # Unlock job and allow submit
+        job.status = "variance_approved"
+        req.status = "approved"
+        req.resolved_at = abu_dhabi_now()
+
+        display_name, _ = _session_user()
+        req.resolved_by = display_name
+
+        db.add(job)
+        db.add(line)
+        db.add(req)
+        db.commit()
+
+        return jsonify({"ok": True, "target_qty": int(line.target_qty)})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/reconcile/line_requests')
+def api_reconcile_line_requests():
+    """Get reconciliation requests for a specific line"""
+    if not _require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    line_id = int(request.args.get("line_id") or 0)
+    if not line_id:
+        return jsonify({"ok": False, "reason": "missing_line_id"}), 400
+
+    db = SessionLocal()
+    try:
+        requests = db.query(ReconciliationRequest).filter(
+            ReconciliationRequest.line_id == line_id,
+            ReconciliationRequest.status == 'pending'
+        ).order_by(ReconciliationRequest.created_at.desc()).all()
+
+        request_data = []
+        for req in requests:
+            request_data.append({
+                'id': req.id,
+                'requested_by': req.requested_by,
+                'requested_qty': req.requested_qty,
+                'created_at': req.created_at.isoformat(),
+                'job_id': req.job_id
+            })
+
+        return jsonify({"ok": True, "requests": request_data})
+
+    finally:
+        db.close()
+
+@app.route('/api/lines/manage')
+def api_lines_manage():
+    """Get all lines with edit permissions for TL/Manager view"""
+    if not _require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    db = SessionLocal()
+    try:
+        display_name, tl_norm = _session_user()
+        is_manager = _is_manager()
+
+        # Get all lines with assignments
+        lines_with_assignments = db.query(Line, Assignment).join(
+            Assignment,
+            (Assignment.line_id == Line.id) & (Assignment.active == True)
+        ).all()
+
+        lines_data = []
+        for line, assignment in lines_with_assignments:
+            # Check current job status
+            current_job = db.query(ScanJob).filter(
+                ScanJob.line_id == line.id,
+                ScanJob.status.in_(['open', 'locked_recon', 'variance_approved'])
+            ).first()
+
+            if current_job:
+                job_status = current_job.status
+            else:
+                job_status = 'submitted'
+
+            # Check edit permissions
+            can_edit = is_manager or (line.created_by_tl_norm == tl_norm)
+
+            # Check for pending reconciliation requests
+            pending_reconciliation = db.query(ReconciliationRequest).filter(
+                ReconciliationRequest.line_id == line.id,
+                ReconciliationRequest.status == 'pending'
+            ).first() is not None
+
+            line_data = {
+                'id': line.id,
+                'line_code': line.line_code,
+                'location': line.location,
+                'warehouse': line.warehouse,
+                'target_qty': line.target_qty,
+                'created_at': line.created_at.strftime('%Y-%m-%d %H:%M'),
+                'counter_name_1': assignment.counter_name_1 if assignment else None,
+                'counter_name_2': assignment.counter_name_2 if assignment else None,
+                'tl_name': assignment.tl_name if assignment else 'Not assigned',
+                'can_edit': can_edit,
+                'status': job_status,
+                'pending_reconciliation': pending_reconciliation
+            }
+            lines_data.append(line_data)
+
+        return jsonify({'ok': True, 'lines': lines_data, 'current_tl': display_name, 'is_manager': is_manager})
+
+    finally:
+        db.close()
+
+@app.route('/api/line/delete', methods=['POST'])
+def api_line_delete():
+    """Delete a line configuration"""
+    data = request.get_json()
+    location = data.get('location')
+    warehouse = data.get('warehouse')
+    line_code = data.get('line_code')
+    tl_name = data.get('tl_name')
+    pin = data.get('pin')
+
+    # Check if this is a manager delete request
+    is_manager_delete = request.headers.get('X-Manager-Delete') == 'true'
+
+    if not all([location, warehouse, line_code]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    # Check TL session
+    tl_session = session.get(SESSION_TL_KEY)
+    is_manager = session.get('is_manager', False)
+
+    if not tl_session:
+        return jsonify({'error': 'TL authentication required'}), 401
+
+    # For manager deletes, we need different validation
+    if is_manager_delete or is_manager:
+        if pin != '240986':
+            return jsonify({'error': 'Invalid passcode'}), 403
+        # Manager can delete any line
+        pass
+    else:
+        # Regular TL delete - require all fields
+        if not all([tl_name, pin]):
+            return jsonify({'error': 'Missing TL credentials'}), 400
+
+    db = SessionLocal()
+    try:
+        # Find the line
+        line = db.query(Line).filter(
+            Line.location == location,
+            Line.warehouse == warehouse,
+            Line.line_code == line_code
+        ).first()
+
+        if not line:
+            return jsonify({'error': 'Line not found'}), 404
+
+        # Verify permissions
+        assignment = db.query(Assignment).filter(
+            Assignment.line_id == line.id,
+            Assignment.active == True
+        ).first()
+
+        if not assignment:
+            return jsonify({'error': 'No assignment found for this line'}), 404
+
+        # Permission check
+        if is_manager or is_manager_delete:
+            # Managers can delete any line with correct passcode (already verified above)
+            pass
+        else:
+            # TL must match and have correct PIN
+            if not verify_pin(pin, assignment.tl_pin_hash):
+                return jsonify({'error': 'Unauthorized or wrong PIN'}), 403
+
+            # Additional check: ensure the requesting TL is the one assigned to this line
+            current_tl_name = tl_session.get('display_name', tl_name)
+            if _norm(current_tl_name) != _norm(assignment.tl_name):
+                return jsonify({'error': 'You can only delete lines you created'}), 403
+
+        # Delete related data in correct order
+        # Delete scans first
+        jobs = db.query(ScanJob).filter(ScanJob.line_id == line.id).all()
+        for job in jobs:
+            db.query(Scan).filter(Scan.job_id == job.id).delete()
+            db.query(Reconciliation).filter(Reconciliation.job_id == job.id).delete()
+            db.query(ReconciliationQueue).filter(ReconciliationQueue.job_id == job.id).delete()
+
+        # Delete jobs
+        db.query(ScanJob).filter(ScanJob.line_id == line.id).delete()
+
+        # Delete assignments
+        db.query(Assignment).filter(Assignment.line_id == line.id).delete()
+
+        # Delete the line
+        db.delete(line)
+
+        # Audit log
+        actor_name = session.get(SESSION_TL_KEY, {}).get('display_name', 'Unknown')
+        audit = AuditLog(
+            actor=actor_name,
+            action='LINE_DELETE',
+            entity='LINE',
+            entity_id=line.id,
+            payload_json=json.dumps({
+                'location': location,
+                'warehouse': warehouse,
+                'line_code': line_code,
+                'deleted_by': 'manager' if (is_manager or is_manager_delete) else 'tl',
+                'original_tl': assignment.tl_name
+            })
+        )
+        db.add(audit)
+
+        db.commit()
+        return jsonify({'ok': True})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/mdf/fresh', methods=['POST'])
+def api_create_fresh_mdf():
+    """Create a fresh MDF.xlsx file (backup old one if exists)"""
+    if not require_tl():
+        return jsonify({"error": "TL authentication required"}), 401
+
+    try:
+        # Backup existing MDF if it exists
+        backup_name = None
+        if os.path.exists(MDF_PATH):
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_name = f"MDF_backup_{timestamp}.xlsx"
+            backup_path = os.path.join(EXPORTS_DIR, backup_name)
+
+            # Copy the existing file as backup
+            import shutil
+            shutil.copy2(MDF_PATH, backup_path)
+
+        # Create fresh MDF with just headers
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+        ws.append(COLUMNS)
+        wb.save(MDF_PATH)
+
+        # Add audit log
+        tl_session = session.get(SESSION_TL_KEY, {})
+        audit = AuditLog(
+            actor=tl_session.get("display_name", "TL"),
+            action='FRESH_MDF_CREATED',
+            entity='MDF',
+            payload_json=json.dumps({"backup_created": backup_name})
+        )
+
+        db = SessionLocal()
+        try:
+            db.add(audit)
+            db.commit()
+        finally:
+            db.close()
+
+        return jsonify({
+            "success": True,
+            "message": "Fresh MDF created successfully",
+            "backup": backup_name
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/logs/delete_all', methods=['DELETE'])
+def api_delete_all_logs():
+    """Delete all log entries (database and historical)"""
+    if not require_tl():
+        return jsonify({"error": "TL authentication required"}), 401
+
+    data = request.get_json() or {}
+    passcode = data.get('passcode', '')
+
+    # Verify passcode
+    if passcode != '240986':
+        return jsonify({"error": "Invalid passcode"}), 403
+
+    db = SessionLocal()
+    try:
+        # Get all completed jobs from database
+        jobs = db.query(ScanJob).filter(
+            ScanJob.status.in_(['submitted', 'variance_approved'])
+        ).all()
+
+        job_count = len(jobs)
+
+        # Delete all database jobs
+        for job in jobs:
+            db.query(Scan).filter(Scan.job_id == job.id).delete()
+            db.query(Reconciliation).filter(Reconciliation.job_id == job.id).delete()
+            db.query(ReconciliationQueue).filter(ReconciliationQueue.job_id == job.id).delete()
+            db.delete(job)
+
+        # Create fresh Excel file (removes all historical data)
+        with FileLock(LOCK_PATH, timeout=10):
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Sheet1"
+            ws.append(COLUMNS)  # Only headers, no data
+            wb.save(MDF_PATH)
+            wb.close()
+
+        # Add audit log
+        tl_session = session.get(SESSION_TL_KEY, {})
+        audit = AuditLog(
+            actor=tl_session.get("display_name", "TL"),
+            action='ALL_LOGS_DELETE',
+            entity='SCANJOB',
+            payload_json=json.dumps({"deleted_count": job_count, "historical_deleted": True})
+        )
+        db.add(audit)
+
+        db.commit()
+        return jsonify({"success": True, "deleted_count": job_count})
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/line-management')
+def line_management():
+    return render_template('line_management.html')
+
+@app.route('/api/line-management/all')
+def api_line_management_all():
+    """Get all lines with their assignments for management - show all but allow editing only own lines"""
+    if not require_tl():
+        return jsonify({"ok": False, "reason": "unauthorized"}), 401
+
+    db = SessionLocal()
+    try:
+        tl_session = session.get(SESSION_TL_KEY, {})
+        tl_name = tl_session.get("display_name", "")
+        is_manager = session.get('is_manager', False)
+        tl_norm = _norm(tl_name)
+
+        # Get all lines with assignments
+        lines_with_assignments = db.query(Line, Assignment).join(
+            Assignment,
+            (Assignment.line_id == Line.id) & (Assignment.active == True)
+        ).all()
+
+        # Get pending requests for this TL or all if manager
+        my_reqs = db.query(ReconciliationRequest).filter(
+            ReconciliationRequest.status == 'pending'
+        ).all()
+        
+        # Map line_id -> req for this TL identity
+        req_by_line = {}
+        for r in my_reqs:
+            if is_manager or (r.tl_name_norm == tl_norm):
+                req_by_line.setdefault(r.line_id, []).append(r)
+
+        lines_data = []
+        for line, assignment in lines_with_assignments:
+            # Check if line has completed jobs
+            completed_jobs = db.query(ScanJob).filter(
+                ScanJob.line_id == line.id,
+                ScanJob.status.in_(['submitted', 'variance_approved'])
+            ).count()
+
+            # Check if line has open jobs
+            open_jobs = db.query(ScanJob).filter(
+                ScanJob.line_id == line.id,
+                ScanJob.status == 'open'
+            ).count()
+
+            # Determine status
+            if completed_jobs > 0 and open_jobs == 0:
+                status = 'completed'
+                status_display = '✅ Completed'
+            elif open_jobs > 0:
+                status = 'active'
+                status_display = '🔄 Active'
+            else:
+                status = 'not_started'
+                status_display = '⏳ Not Started'
+
+            # Check for pending requests
+            reqs = req_by_line.get(line.id, [])
+            pending_request = None
+            if reqs:
+                # Pick oldest pending
+                pending = sorted(reqs, key=lambda x: x.created_at)[0]
+                pending_request = {
+                    "request_id": pending.id,
+                    "requested_qty": int(pending.requested_qty or 0),
+                    "requested_by": pending.requested_by,
+                    "reason": pending.reason
+                }
+
+            line_data = {
+                'id': line.id,
+                'line_code': line.line_code,
+                'location': line.location,
+                'warehouse': line.warehouse,
+                'target_qty': line.target_qty,
+                'created_at': line.created_at.strftime('%Y-%m-%d %H:%M'),
+                'updated_at': line.updated_at.strftime('%Y-%m-%d %H:%M'),
+                'counter_name_1': assignment.counter_name_1 if assignment else None,
+                'counter_name_2': assignment.counter_name_2 if assignment else None,
+                'tl_name': assignment.tl_name if assignment else 'Not assigned',
+                'can_edit': is_manager or (tl_name.lower() == assignment.tl_name.lower() if assignment else False),
+                'status': status,
+                'status_display': status_display,
+                'completed_jobs': completed_jobs,
+                'open_jobs': open_jobs,
+                'pending_request': pending_request
+            }
+            lines_data.append(line_data)
+
+        return jsonify({'ok': True, 'lines': lines_data, 'current_tl': tl_name, 'is_manager': is_manager})
+
+    finally:
+        db.close()
+
+@app.route('/insights')
+def insights():
+    return render_template('insights.html')
+
+@app.route('/api/counter/assignments')
+def api_counter_assignments():
+    """Get assignments for a specific counter"""
+    counter_name = request.args.get('counter_name', '').strip()
+
+    if not counter_name:
+        return jsonify({"ok": False, "reason": "missing_counter"}), 400
+
+    db = SessionLocal()
+    try:
+        print(f"DEBUG ASSIGNMENTS: Looking for assignments for counter: '{counter_name}'")
+        
+        # Find all assignments where this counter is assigned (case-insensitive)
+        assignments = db.query(Assignment, Line).join(
+            Line, Assignment.line_id == Line.id
+        ).filter(
+            Assignment.active == True
+        ).all()
+
+        print(f"DEBUG ASSIGNMENTS: Found {len(assignments)} total active assignments")
+
+        counter_assignments = []
+        counter_name_lower = counter_name.lower().strip()
+        
+        for assignment, line in assignments:
+            print(f"DEBUG ASSIGNMENTS: Checking assignment - Line {line.line_code} at {line.location}/{line.warehouse}")
+            print(f"DEBUG ASSIGNMENTS: Counter1: '{assignment.counter_name_1}', Counter2: '{assignment.counter_name_2}'")
+            
+            # Check if counter matches either position (case-insensitive)
+            counter1_match = assignment.counter_name_1 and assignment.counter_name_1.lower().strip() == counter_name_lower
+            counter2_match = assignment.counter_name_2 and assignment.counter_name_2.lower().strip() == counter_name_lower
+            
+            if not (counter1_match or counter2_match):
+                print(f"DEBUG ASSIGNMENTS: Counter '{counter_name}' not assigned to line {line.line_code}")
+                continue
+                
+            print(f"DEBUG ASSIGNMENTS: ✅ Counter '{counter_name}' IS assigned to line {line.line_code}")
+            
+            # Check if there's an active job for this line
+            current_job = db.query(ScanJob).filter(
+                ScanJob.line_id == line.id,
+                ScanJob.status.in_(['open', 'locked_recon', 'variance_approved'])
+            ).first()
+            
+            # Also check for completed jobs
+            completed_jobs = db.query(ScanJob).filter(
+                ScanJob.line_id == line.id,
+                ScanJob.status == 'submitted'
+            ).count()
+            
+            if current_job:
+                print(f"DEBUG ASSIGNMENTS: Active job found for line {line.line_code} with status: {current_job.status}")
+                counter_assignments.append({
+                    'location': line.location,
+                    'warehouse': line.warehouse,
+                    'line_code': line.line_code,
+                    'target_qty': line.target_qty,
+                    'tl_name': assignment.tl_name,
+                    'line_id': line.id,
+                    'job_id': current_job.id,
+                    'job_status': current_job.status
+                })
+            elif completed_jobs == 0:
+                print(f"DEBUG ASSIGNMENTS: No jobs found for line {line.line_code} - creating assignment opportunity")
+                # Include lines without any jobs - they need to be started
+                counter_assignments.append({
+                    'location': line.location,
+                    'warehouse': line.warehouse,
+                    'line_code': line.line_code,
+                    'target_qty': line.target_qty,
+                    'tl_name': assignment.tl_name,
+                    'line_id': line.id,
+                    'job_id': None,
+                    'job_status': 'ready_to_start'
+                })
+            else:
+                print(f"DEBUG ASSIGNMENTS: Line {line.line_code} has completed jobs but no active job - line finished")
+
+        print(f"DEBUG ASSIGNMENTS: ✅ FINAL RESULT: Returning {len(counter_assignments)} assignments to frontend")
+        for assignment in counter_assignments:
+            print(f"DEBUG ASSIGNMENTS: ➤ {assignment['location']}/{assignment['warehouse']}/Line {assignment['line_code']} (Status: {assignment['job_status']})")
+        
+        return jsonify({
+            "ok": True,
+            "assignments": counter_assignments
+        })
+
+    finally:
+        db.close()
+
+@app.route('/api/insights/dashboard')
+def api_insights_dashboard():
+    """Get dashboard insights data for managers"""
+    db = SessionLocal()
+    try:
+        # Get total lines
+        total_lines = db.query(Line).count()
+
+        # Get job statistics
+        active_jobs = db.query(ScanJob).filter(ScanJob.status == 'open').count()
+        completed_jobs = db.query(ScanJob).filter(ScanJob.status.in_(['submitted', 'variance_approved'])).count()
+
+        # Get total scans
+        total_scans = db.query(func.sum(Scan.qty)).scalar() or 0
+
+        # Get location data
+        location_data = []
+        for location in LOCATIONS:
+            lines_count = db.query(Line).filter(Line.location == location).count()
+            active_jobs_count = db.query(ScanJob).join(Line).filter(
+                Line.location == location,
+                ScanJob.status == 'open'
+            ).count()
+
+            location_data.append({
+                'location': location,
+                'lines': lines_count,
+                'activeJobs': active_jobs_count
+            })
+
+        # Get status data
+        status_data = []
+        statuses = ['open', 'submitted', 'variance_approved']
+        for status in statuses:
+            count = db.query(ScanJob).filter(ScanJob.status == status).count()
+            if count > 0:
+                status_data.append({
+                    'status': status.replace('_', ' ').title(),
+                    'count': count
+                })
+
+        # Get TL performance
+        tl_performance = []
+        assignments = db.query(Assignment).filter(Assignment.active == True).all()
+        tl_stats = {}
+
+        for assignment in assignments:
+            tl_name = assignment.tl_name
+            if tl_name not in tl_stats:
+                tl_stats[tl_name] = {
+                    'name': tl_name,
+                    'linesManaged': 0,
+                    'activeJobs': 0,
+                    'completedJobs': 0,
+                    'totalScans': 0
+                }
+
+            tl_stats[tl_name]['linesManaged'] += 1
+
+            # Get jobs for this line
+            line_jobs = db.query(ScanJob).filter(ScanJob.line_id == assignment.line_id).all()
+            for job in line_jobs:
+                if job.status == 'open':
+                    tl_stats[tl_name]['activeJobs'] += 1
+                elif job.status in ['submitted', 'variance_approved']:
+                    tl_stats[tl_name]['completedJobs'] += 1
+
+                # Get scans for this job
+                job_scans = db.query(func.sum(Scan.qty)).filter(Scan.job_id == job.id).scalar() or 0
+                tl_stats[tl_name]['totalScans'] += job_scans
+
+        tl_performance = list(tl_stats.values())
+
+        # Get active lines detail
+        active_lines = []
+        lines_with_jobs = db.query(Line, ScanJob).join(ScanJob).filter(
+            ScanJob.status == 'open'
+        ).all()
+
+        for line, job in lines_with_jobs:
+            # Get assignment
+            assignment = db.query(Assignment).filter(
+                Assignment.line_id == line.id,
+                Assignment.active == True
+            ).first()
+
+            # Get scanned count
+            scanned = db.query(func.sum(Scan.qty)).filter(Scan.job_id == job.id).scalar() or 0
+
+            assigned_counters = []
+            if assignment:
+                if assignment.counter_name_1:
+                    assigned_counters.append(assignment.counter_name_1)
+                if assignment.counter_name_2:
+                    assigned_counters.append(assignment.counter_name_2)
+
+            active_lines.append({
+                'lineCode': line.line_code,
+                'location': line.location,
+                'warehouse': line.warehouse,
+                'target': line.target_qty,
+                'scanned': int(scanned),
+                'status': job.status,
+                'assignedCounters': ', '.join(assigned_counters) if assigned_counters else 'Not assigned'
+            })
+
+        return jsonify({
+            'ok': True,
+            'totalLines': total_lines,
+            'activeJobs': active_jobs,
+            'completedJobs': completed_jobs,
+            'totalScans': int(total_scans),
+            'locationData': location_data,
+            'statusData': status_data,
+            'tlPerformance': tl_performance,
+            'activeLines': active_lines
+        })
+
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/health')
+def health():
+    return jsonify({'ok': True})
+
+if __name__ == '__main__':
+    with app.app_context():
+        init_db()
+        ensure_mdf()
+    print("\n🚀 DSV STOCK COUNT - Line-Based Stock Count App Started!")
+    print("Access the app at: http://0.0.0.0:5000")
+
+    app.run(host='0.0.0.0', port=5000, debug=True)
