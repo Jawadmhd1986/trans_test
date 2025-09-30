@@ -1,0 +1,127 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DSV STOCK COUNT - Reconciliation Center</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-blue-900 mb-2">Reconciliation Center</h1>
+            <p class="text-gray-600">Team Leader Variance Management</p>
+        </div>
+
+        <div class="max-w-3xl mx-auto">
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <!-- TL Login Section - Always visible until logged in -->
+                <div id="tlLoginSection">
+                    <div class="mb-6">
+                        <div class="p-3 bg-yellow-50 border border-yellow-200 rounded mb-4">
+                            <p class="text-yellow-800 font-medium">📋 Reconciliation Center</p>
+                            <p class="text-sm text-yellow-700 mt-1">Please login as a Team Leader to view and respond to reconciliation requests from counters.</p>
+                            <p class="text-xs text-yellow-600 mt-2">Available TLs: Altaf, Faran, Rojin</p>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-3 mb-3">
+                        <div>
+                            <label class="text-sm font-medium text-gray-700 mb-2 block">TL Name</label>
+                            <select id="recTlName" class="w-full border rounded p-2">
+                                <option value="">Select Team Leader</option>
+                                <option value="Altaf">Altaf</option>
+                                <option value="Faran">Faran</option>
+                                <option value="Rojin">Rojin</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="text-sm font-medium text-gray-700 mb-2 block">TL PIN</label>
+                            <input id="recTlPin" type="password" class="w-full border rounded p-2" placeholder="••••">
+                        </div>
+                    </div>
+
+                    <div class="flex gap-3 mb-3">
+                        <button id="recLoginBtn" class="bg-gray-900 text-white px-4 py-2 rounded">Login</button>
+                    </div>
+                </div>
+
+                <!-- Workspace Section - Hidden until login -->
+                <div id="tlWorkspaceSection" class="hidden">
+                    <!-- Location/Warehouse/Line Selection -->
+                    <div class="grid grid-cols-2 gap-3 mb-3">
+                        <div>
+                            <label class="text-sm font-medium text-gray-700 mb-2 block">Location <span class="text-xs text-gray-500">(Auto-populated)</span></label>
+                            <select id="recLocation" class="w-full border rounded p-2">
+                                <option value="">Select Location</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="text-sm font-medium text-gray-700 mb-2 block">Warehouse <span class="text-xs text-gray-500">(Auto-populated)</span></label>
+                            <select id="recWarehouse" class="w-full border rounded p-2">
+                                <option value="">Select location first</option>
+                            </select>
+                        </div>
+                        <div class="col-span-2">
+                            <label class="text-sm font-medium text-gray-700 mb-2 block">Line Code <span class="text-xs text-gray-500">(Showing lines requiring action)</span></label>
+                            <select id="recLineCode" class="w-full border rounded p-2">
+                                <option value="">Select warehouse first</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="flex gap-3 mb-3">
+                        <button id="recRefreshBtn" class="border px-4 py-2 rounded">Refresh</button>
+                    </div>
+
+                    <div id="recState" class="text-sm mb-3 p-3 bg-gray-50 rounded">Select location, warehouse and line to view state.</div>
+
+                    <div id="recActions">
+                        <div class="grid grid-cols-2 gap-3 mb-3">
+                            <div>
+                                <label class="text-sm font-medium text-gray-700 mb-2 block">Current Target Quantity</label>
+                                <input id="recCurrentTarget" type="number" class="w-full border rounded p-2 bg-gray-50" readonly placeholder="Current target will appear here">
+                            </div>
+                            <div>
+                                <label class="text-sm font-medium text-gray-700 mb-2 block">New Target Quantity</label>
+                                <input id="recNewTarget" type="number" min="0" class="w-full border rounded p-2">
+                            </div>
+                            <div class="col-span-2">
+                                <label class="text-sm font-medium text-gray-700 mb-2 block">Note (variance)</label>
+                                <input id="recNote" class="w-full border rounded p-2" placeholder="Reason / note">
+                            </div>
+                        </div>
+                        <div class="flex gap-3">
+                            <button id="recEditTargetBtn" class="bg-blue-600 text-white px-4 py-2 rounded">Edit Target</button>
+                            <button id="recApproveVarBtn" class="bg-emerald-600 text-white px-4 py-2 rounded">Approve Variance</button>
+                        </div>
+                    </div>
+
+                    <!-- Pending Reconciliation Requests -->
+                    <div id="pendingRequests" class="hidden mt-6">
+                        <h3 class="text-lg font-semibold mb-4 text-red-600">🔔 Pending Reconciliation Requests</h3>
+                        <div id="requestsList" class="space-y-3">
+                            <!-- Requests will be loaded here -->
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mt-6 text-center">
+                    <a href="/" class="text-blue-600 hover:text-blue-800">← Back to Home</a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/reconcile.js') }}"></script>
+    <script>
+        // Auto-refresh helper
+        document.getElementById('recRefreshBtn').addEventListener('click', () => {
+            const ev = new Event('change');
+            document.getElementById('recLineCode').dispatchEvent(ev);
+        });
+    </script>
+</body>
+</html>

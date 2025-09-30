@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DSV STOCK COUNT - Line Management</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <script>
+        // Check TL authentication
+        function checkTLAuth() {
+            const userData = localStorage.getItem('dsv_user');
+            if (!userData) {
+                window.location.href = '/signin';
+                return false;
+            }
+
+            try {
+                const user = JSON.parse(userData);
+                const signedInTime = new Date(user.signedInAt);
+                const now = new Date();
+                const hoursDiff = (now - signedInTime) / (1000 * 60 * 60);
+
+                if (hoursDiff >= 8) {
+                    localStorage.removeItem('dsv_user');
+                    window.location.href = '/signin';
+                    return false;
+                }
+
+                // Only TLs and Managers should access line management page
+                if (user.role !== 'tl' && user.role !== 'manager') {
+                    window.location.href = '/';
+                    return false;
+                }
+
+                // Check if user is a manager
+                if (user.role === 'manager') {
+                    window.isManager = true;
+                    // Initialize manager settings after DOM is loaded
+                    document.addEventListener('DOMContentLoaded', initializeManager);
+                    // If DOM is already loaded, initialize immediately
+                    if (document.readyState === 'loading') {
+                        document.addEventListener('DOMContentLoaded', initializeManager);
+                    } else {
+                        initializeManager();
+                    }
+                }
+
+                return true;
+            } catch (e) {
+                localStorage.removeItem('dsv_user');
+                window.location.href = '/signin';
+                return false;
+            }
+        }
+
+        function initializeManager() {
+            // Show manager quick access section
+            showManagerQuickAccess();
+            // Set currentTL for managers to bypass TL login
+            currentTL = 'Manager';
+            // Show lines section immediately for managers
+            const linesSection = document.getElementById('linesSection');
+            if (linesSection) {
+                linesSection.classList.remove('hidden');
+                loadLines();
+            }
+            // Hide the TL login section for managers
+            const tlLoginSection = document.querySelector('.bg-white.rounded-lg.shadow-md.p-6.mb-6');
+            if (tlLoginSection && tlLoginSection.querySelector('#tlName')) {
+                tlLoginSection.style.display = 'none';
+            }
+        }
+
+        function showManagerQuickAccess() {
+            const container = document.querySelector('.container');
+            const quickAccessSection = document.createElement('div');
+            quickAccessSection.className = 'bg-indigo-50 border border-indigo-200 rounded-lg shadow-md p-6 mb-6';
+            quickAccessSection.innerHTML = `
+                <h2 class="text-xl font-semibold text-indigo-800 mb-4">Manager Quick Access</h2>
+                <p class="text-indigo-600 mb-4">As a manager, you can access logs and insights directly without TL authentication.</p>
+                <div class="flex gap-4">
+                    <a href="/log" class="bg-indigo-600 text-white px-6 py-3 rounded-lg hover:bg-indigo-700 transition duration-200">
+                        📋 View All Logs
+                    </a>
+                    <a href="/insights" class="bg-purple-600 text-white px-6 py-3 rounded-lg hover:bg-purple-700 transition duration-200">
+                        📊 Insights Dashboard
+                    </a>
+                </div>
+            `;
+
+            // Insert after the header section
+            const headerSection = container.children[0];
+            container.insertBefore(quickAccessSection, headerSection.nextSibling);
+        }
+
+        if (!checkTLAuth()) {
+            document.body.innerHTML = '<div class="text-center p-8">Redirecting to sign in...</div>';
+        }
+    </script>
+
+    <div class="container mx-auto px-4 py-8">
+        <div class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-3xl font-bold text-blue-900 mb-2">Line Code Management</h1>
+                <p class="text-gray-600">Manage line configurations and assignments</p>
+            </div>
+            <a href="/" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition duration-200">
+                ← Back to Home
+            </a>
+        </div>
+
+        <!-- TL Login Section -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Team Leader Login</h2>
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">TL Name</label>
+                    <select id="tlName" class="w-full p-3 border border-gray-300 rounded-lg">
+                        <option value="">Select Team Leader</option>
+                        <option value="Altaf">Altaf</option>
+                        <option value="Faran">Faran</option>
+                        <option value="Rojin">Rojin</option>
+
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">PIN</label>
+                    <input type="password" id="tlPin" class="w-full p-3 border border-gray-300 rounded-lg" placeholder="Enter PIN">
+                </div>
+            </div>
+            <button id="loginBtn" class="mt-4 bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition duration-200">
+                Login
+            </button>
+        </div>
+
+        <!-- Lines Management Section (Hidden initially) -->
+        <div id="linesSection" class="hidden">
+            <!-- Filter Section -->
+            <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                <h2 class="text-xl font-semibold text-gray-800 mb-4">Filter Lines</h2>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Location</label>
+                        <select id="filterLocation" class="w-full p-3 border border-gray-300 rounded-lg">
+                            <option value="">All Locations</option>
+                            <option value="KIZAD">KIZAD</option>
+                            <option value="JEBEL_ALI">JEBEL_ALI</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Warehouse</label>
+                        <select id="filterWarehouse" class="w-full p-3 border border-gray-300 rounded-lg">
+                            <option value="">All Warehouses</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Lines Table -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-semibold text-gray-800">Line Configurations</h2>
+                    <button id="refreshBtn" class="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition duration-200">
+                        Refresh
+                    </button>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="w-full table-auto">
+                        <thead>
+                            <tr class="border-b bg-gray-50">
+                                <th class="text-left py-3 px-4">Line Code</th>
+                                <th class="text-left py-3 px-4">Location</th>
+                                <th class="text-left py-3 px-4">Warehouse</th>
+                                <th class="text-left py-3 px-4">Target Qty</th>
+                                <th class="text-left py-3 px-4">Counter 1</th>
+                                <th class="text-left py-3 px-4">Counter 2</th>
+                                <th class="text-left py-3 px-4">TL</th>
+                                <th class="text-left py-3 px-4">Status</th>
+                                <th class="text-left py-3 px-4">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="linesTableBody">
+                            <!-- Lines will be populated here -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <div id="noLinesMessage" class="text-center py-8 text-gray-500 hidden">
+                    <p>No lines found. Create some lines first.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Line Modal -->
+    <div id="editModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50">
+        <div class="flex items-center justify-center min-h-screen p-4">
+            <div class="bg-white rounded-lg max-w-md w-full p-6">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 class="text-lg font-semibold">Edit Line</h3>
+                    <button id="closeEditModal" class="text-gray-400 hover:text-gray-600">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                    </button>
+                </div>
+
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Line Code</label>
+                        <input type="text" id="editLineCode" class="w-full p-3 border border-gray-300 rounded-lg bg-gray-100" readonly>
+                    </div>
+
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Target Quantity</label>
+                        <input type="number" id="editTargetQty" class="w-full p-3 border border-gray-300 rounded-lg" min="1">
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Counter 1</label>
+                            <select id="editCounter1" class="w-full p-3 border border-gray-300 rounded-lg">
+                                <option value="">Select Counter</option>
+                                <option value="Hani">Hani</option>
+                                <option value="hasan">hasan</option>
+                                <option value="sami">sami</option>
+                                <option value="erol">erol</option>
+                                <option value="ali">ali</option>
+                                <option value="omar">omar</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Counter 2</label>
+                            <select id="editCounter2" class="w-full p-3 border border-gray-300 rounded-lg">
+                                <option value="">Select Counter</option>
+                                <option value="Hani">Hani</option>
+                                <option value="hasan">hasan</option>
+                                <option value="sami">sami</option>
+                                <option value="erol">erol</option>
+                                <option value="ali">ali</option>
+                                <option value="omar">omar</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="flex gap-3">
+                        <button id="saveEditBtn" class="flex-1 bg-green-600 text-white py-3 px-6 rounded-lg hover:bg-green-700">
+                            Save Changes
+                        </button>
+                        <button id="cancelEditBtn" class="flex-1 bg-gray-600 text-white py-3 px-6 rounded-lg hover:bg-gray-700">
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete Confirmation Modal -->
+    <div id="deleteModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50">
+        <div class="flex items-center justify-center min-h-screen p-4">
+            <div class="bg-white rounded-lg max-w-md w-full p-6">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 class="text-lg font-semibold">Confirm Delete</h3>
+                    <button id="closeDeleteModal" class="text-gray-400 hover:text-gray-600">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                    </button>
+                </div>
+
+                <div class="space-y-4">
+                    <p id="deleteMessage">Are you sure you want to delete this line?</p>
+
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Enter Passcode</label>
+                        <input type="password" id="deletePasscode" class="w-full p-3 border border-gray-300 rounded-lg" placeholder="Enter passcode">
+                    </div>
+
+                    <div class="flex gap-3">
+                        <button id="confirmDeleteBtn" class="flex-1 bg-red-600 text-white py-3 px-6 rounded-lg hover:bg-red-700">
+                            Delete
+                        </button>
+                        <button id="cancelDeleteBtn" class="flex-1 bg-gray-600 text-white py-3 px-6 rounded-lg hover:bg-gray-700">
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reset Confirmation Modal -->
+    <div id="resetModal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
+        <div class="bg-white rounded-lg p-6 w-96">
+            <h3 class="text-lg font-semibold mb-4">Reset Line</h3>
+            <p class="text-gray-600 mb-4">Enter passcode to reset this line and allow new counting:</p>
+            <input type="password" id="resetPasscode" placeholder="Enter passcode" class="w-full border rounded px-3 py-2 mb-4">
+            <div class="flex space-x-2">
+                <button id="confirmResetBtn" class="bg-orange-500 text-white px-4 py-2 rounded hover:bg-orange-600">Reset Line</button>
+                <button onclick="hideResetModal()" class="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reconciliation Modal -->
+    <div id="reconcileModal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
+        <div class="bg-white rounded-lg p-6 w-96 max-w-lg">
+            <h3 class="text-lg font-semibold mb-4">Reconciliation Request</h3>
+            <div id="reconcileContent">
+                <!-- Content will be populated dynamically -->
+            </div>
+            <div class="flex space-x-2 mt-4">
+                <button id="approveReconcileBtn" class="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600">Approve</button>
+                <button id="editTargetReconcileBtn" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Edit Target</button>
+                <button onclick="hideReconcileModal()" class="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="fixed top-4 right-4 bg-red-500 text-white px-6 py-3 rounded-lg shadow-lg hidden z-50">
+        <span id="toastMessage"></span>
+    </div>
+
+    <script>
+        let currentTL = null;
+        let currentLines = [];
+        let editingLine = null;
+        let deletingLine = null;
+        let currentDeleteIndex = -1; // To store the index of the line to be deleted
+        let resettingLine = null;
+        let resetLineId = null; // To store the ID of the line to be reset
+
+        const warehouses = {
+            "KIZAD": ["KIZAD-W1"],
+            "JEBEL_ALI": ["JA-W1", "JA-W2", "JA-W3"]
+        };
+
+        // Elements
+        const loginBtn = document.getElementById('loginBtn');
+        const linesSection = document.getElementById('linesSection');
+        const tlName = document.getElementById('tlName');
+        const tlPin = document.getElementById('tlPin');
+        const filterLocation = document.getElementById('filterLocation');
+        const filterWarehouse = document.getElementById('filterWarehouse');
+        const refreshBtn = document.getElementById('refreshBtn');
+        const linesTableBody = document.getElementById('linesTableBody');
+        const noLinesMessage = document.getElementById('noLinesMessage');
+        const toast = document.getElementById('toast');
+        const toastMessage = document.getElementById('toastMessage');
+
+        // Modal elements
+        const editModal = document.getElementById('editModal');
+        const deleteModal = document.getElementById('deleteModal');
+        const resetModal = document.getElementById('resetModal'); // Get the reset modal element
+
+        // TL Login
+        loginBtn.addEventListener('click', async function() {
+            const name = tlName.value;
+            const pin = tlPin.value;
+
+            if (!name || !pin) {
+                showToast('Please select TL and enter PIN', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/tl/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tl_name: name, tl_pin: pin })
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.ok) {
+                    currentTL = name;
+                    showToast('Login successful!', 'success');
+                    linesSection.classList.remove('hidden');
+                    loadLines();
+                } else {
+                    showToast(result.reason === 'bad_pin' ? 'Invalid PIN' : 'Access denied', 'error');
+                }
+            } catch (error) {
+                showToast('Network error', 'error');
+            }
+        });
+
+        // Manager initialization is now handled in checkTLAuth() function
+
+        // Update warehouse filter based on location
+        filterLocation.addEventListener('change', function() {
+            const location = this.value;
+            filterWarehouse.innerHTML = '<option value="">All Warehouses</option>';
+
+            if (location && warehouses[location]) {
+                warehouses[location].forEach(warehouse => {
+                    const option = document.createElement('option');
+                    option.value = warehouse;
+                    option.textContent = warehouse;
+                    filterWarehouse.appendChild(option);
+                });
+            }
+
+            loadLines();
+        });
+
+        filterWarehouse.addEventListener('change', loadLines);
+        refreshBtn.addEventListener('click', loadLines);
+
+        // Load lines
+        async function loadLines() {
+            if (!currentTL) return;
+
+            try {
+                const response = await fetch('/api/line-management/all');
+                if (response.ok) {
+                    const result = await response.json();
+                    currentLines = result.lines || [];
+                    renderLines();
+                } else {
+                    showToast('Failed to load lines', 'error');
+                }
+            } catch (error) {
+                showToast('Network error loading lines', 'error');
+            }
+        }
+
+        // Render lines table
+        function renderLines() {
+            const locationFilter = filterLocation.value;
+            const warehouseFilter = filterWarehouse.value;
+
+            let filteredLines = currentLines;
+
+            if (locationFilter) {
+                filteredLines = filteredLines.filter(line => line.location === locationFilter);
+            }
+            if (warehouseFilter) {
+                filteredLines = filteredLines.filter(line => line.warehouse === warehouseFilter);
+            }
+
+            linesTableBody.innerHTML = '';
+
+            if (filteredLines.length === 0) {
+                noLinesMessage.classList.remove('hidden');
+                return;
+            }
+
+            noLinesMessage.classList.add('hidden');
+
+            filteredLines.forEach(line => {
+                const row = document.createElement('tr');
+                row.className = 'border-b hover:bg-gray-50';
+
+                // Check if current TL can edit this line
+                const canEdit = window.isManager || (currentTL && currentTL.toLowerCase() === line.tl_name.toLowerCase());
+
+                // Determine delete permissions
+                const canDelete = window.isManager || (currentTL && currentTL.toLowerCase() === line.tl_name.toLowerCase());
+
+                const actionsHtml = canEdit ? `
+                    <div class="flex gap-2">
+                        <button onclick="editLine(${line.id})" class="bg-blue-500 text-white px-3 py-1 rounded text-sm hover:bg-blue-600" ${line.status === 'completed' ? 'disabled title="Cannot edit completed line"' : ''}>
+                            Edit
+                        </button>
+                        ${canDelete ? `
+                            <button onclick="deleteLine(${line.id})" class="bg-red-500 text-white px-3 py-1 rounded text-sm hover:bg-red-600">
+                                Delete
+                            </button>
+                        ` : ''}
+                        ${line.status === 'completed' ? `
+                            <button onclick="showResetModal(${line.id})" class="bg-orange-500 text-white px-3 py-1 rounded text-sm hover:bg-orange-600" title="Reset line to allow new counting">
+                                Reset
+                            </button>
+                        ` : ''}
+                        ${line.pending_reconciliation ? `
+                            <button onclick="showReconcileModal(${line.id})" class="bg-red-500 text-white px-3 py-1 rounded text-sm hover:bg-red-600 animate-pulse" title="Has pending reconciliation request">
+                                🔔 Reconcile
+                            </button>
+                        ` : ''}
+                    </div>
+                ` : `
+                    <div class="flex gap-2">
+                        ${canDelete ? `
+                            <button onclick="deleteLine(${line.id})" class="bg-red-500 text-white px-3 py-1 rounded text-sm hover:bg-red-600">
+                                Delete
+                            </button>
+                        ` : ''}
+                        <span class="text-gray-500 text-sm px-3 py-1">View Only</span>
+                    </div>
+                `;
+
+                // Add styling based on status
+                let statusClass = '';
+                if (line.status === 'completed') {
+                    statusClass = 'bg-green-50';
+                } else if (line.status === 'active') {
+                    statusClass = 'bg-blue-50';
+                } else {
+                    statusClass = 'bg-gray-50';
+                }
+
+                row.className = `border-b hover:bg-gray-50 ${statusClass}`;
+
+                row.innerHTML = `
+                    <td class="py-3 px-4 font-medium">${line.line_code}</td>
+                    <td class="py-3 px-4">${line.location}</td>
+                    <td class="py-3 px-4">${line.warehouse}</td>
+                    <td class="py-3 px-4">${line.target_qty}</td>
+                    <td class="py-3 px-4">${line.counter_name_1 || 'Not assigned'}</td>
+                    <td class="py-3 px-4">${line.counter_name_2 || 'Not assigned'}</td>
+                    <td class="py-3 px-4">${line.tl_name}</td>
+                    <td class="py-3 px-4">
+                        <span class="text-sm font-medium">${line.status_display}</span>
+                        ${line.completed_jobs > 0 ? `<br><span class="text-xs text-gray-500">${line.completed_jobs} completed</span>` : ''}
+                    </td>
+                    <td class="py-3 px-4">
+                        ${actionsHtml}
+                    </td>
+                `;
+                linesTableBody.appendChild(row);
+            });
+        }
+
+        // Edit line
+        function editLine(lineId) {
+            editingLine = currentLines.find(line => line.id === lineId);
+            if (!editingLine) return;
+
+            // Check if current TL can edit this line
+            const canEdit = window.isManager || (currentTL && currentTL.toLowerCase() === editingLine.tl_name.toLowerCase());
+            if (!canEdit) {
+                showToast('You can only edit lines that you created', 'error');
+                return;
+            }
+
+            // Prevent editing completed lines
+            if (editingLine.status === 'completed') {
+                showToast('Cannot edit completed lines. Use Reset to allow new counting.', 'error');
+                return;
+            }
+
+            document.getElementById('editLineCode').value = editingLine.line_code;
+            document.getElementById('editTargetQty').value = editingLine.target_qty;
+            document.getElementById('editCounter1').value = editingLine.counter_name_1 || '';
+            document.getElementById('editCounter2').value = editingLine.counter_name_2 || '';
+
+            editModal.classList.remove('hidden');
+        }
+
+        // Save edit
+        document.getElementById('saveEditBtn').addEventListener('click', async function() {
+            if (!editingLine) return;
+
+            const targetQty = parseInt(document.getElementById('editTargetQty').value);
+            const counter1 = document.getElementById('editCounter1').value;
+            const counter2 = document.getElementById('editCounter2').value;
+
+            if (!targetQty || targetQty < 1) {
+                showToast('Please enter a valid target quantity', 'error');
+                return;
+            }
+
+            if (!counter1 || !counter2) {
+                showToast('Please select both counters', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/line/upsert', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        location: editingLine.location,
+                        warehouse: editingLine.warehouse,
+                        line_code: editingLine.line_code,
+                        target_qty: targetQty,
+                        counter1: counter1,
+                        counter2: counter2,
+                        tl_name: currentTL,
+                        pin: tlPin.value
+                    })
+                });
+
+                if (response.ok) {
+                    showToast('Line updated successfully!', 'success');
+                    editModal.classList.add('hidden');
+                    loadLines();
+                } else {
+                    const error = await response.json();
+                    showToast(error.error || 'Update failed', 'error');
+                }
+            } catch (error) {
+                showToast('Network error', 'error');
+            }
+        });
+
+        // Show reset modal
+        function showResetModal(lineId) {
+            resettingLine = currentLines.find(line => line.id === lineId);
+            if (!resettingLine) return;
+
+            // Check if current TL can reset this line
+            const canReset = window.isManager || (currentTL && currentTL.toLowerCase() === resettingLine.tl_name.toLowerCase());
+            if (!canReset) {
+                showToast('You can only reset lines that you created', 'error');
+                return;
+            }
+
+            document.getElementById('resetMessage').textContent = `Are you sure you want to reset line "${resettingLine.line_code}"? This will create a new counting job for this line.`;
+            resetModal.classList.remove('hidden');
+            resetModal.classList.add('flex'); // Use flex for centering
+            document.getElementById('resetPasscode').focus();
+        }
+
+        // Hide reset modal
+        window.hideResetModal = function() {
+            resettingLine = null; // Clear the selected line for reset
+            resetModal.classList.add('hidden');
+            resetModal.classList.remove('flex');
+            document.getElementById('resetPasscode').value = '';
+        };
+
+        // Show reconciliation modal
+        let currentReconcileData = null;
+        window.showReconcileModal = async function(lineId) {
+            const line = currentLines.find(l => l.id === lineId);
+            if (!line) return;
+
+            try {
+                // Get reconciliation requests for this line
+                const response = await fetch(`/api/reconcile/line_requests?line_id=${lineId}`);
+                const result = await response.json();
+
+                if (result.ok && result.requests && result.requests.length > 0) {
+                    const request = result.requests[0]; // Get first pending request
+                    currentReconcileData = { line, request };
+
+                    const content = document.getElementById('reconcileContent');
+                    content.innerHTML = `
+                        <div class="space-y-3">
+                            <div class="bg-yellow-50 border border-yellow-200 rounded p-3">
+                                <p class="font-medium text-yellow-800">Line ${line.line_code}</p>
+                                <p class="text-sm text-yellow-700">Requested by: ${request.requested_by}</p>
+                                <p class="text-sm text-yellow-700">Time: ${new Date(request.created_at).toLocaleString()}</p>
+                            </div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div class="text-center">
+                                    <div class="text-2xl font-bold text-orange-600">${line.target_qty}</div>
+                                    <div class="text-sm text-gray-600">Current Target</div>
+                                </div>
+                                <div class="text-center">
+                                    <div class="text-2xl font-bold text-green-600">${request.requested_qty || 'N/A'}</div>
+                                    <div class="text-sm text-gray-600">Requested Qty</div>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">New Target (optional)</label>
+                                <input type="number" id="newReconcileTarget" value="${request.requested_qty || line.target_qty}" 
+                                       class="w-full border rounded px-3 py-2" min="0">
+                            </div>
+                        </div>
+                    `;
+
+                    const reconcileModal = document.getElementById('reconcileModal');
+                    reconcileModal.classList.remove('hidden');
+                    reconcileModal.classList.add('flex');
+                } else {
+                    showToast('No reconciliation requests found for this line', 'error');
+                }
+            } catch (error) {
+                showToast('Error loading reconciliation data', 'error');
+            }
+        };
+
+        // Hide reconciliation modal
+        window.hideReconcileModal = function() {
+            const reconcileModal = document.getElementById('reconcileModal');
+            reconcileModal.classList.add('hidden');
+            reconcileModal.classList.remove('flex');
+            currentReconcileData = null;
+        };
+
+        // Approve reconciliation
+        document.getElementById('approveReconcileBtn').addEventListener('click', async () => {
+            if (!currentReconcileData) return;
+
+            try {
+                const response = await fetch('/api/reconcile/resolve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        request_id: currentReconcileData.request.id,
+                        action: 'approve_variance'
+                    })
+                });
+
+                if (response.ok) {
+                    showToast('Reconciliation approved! Counter can now submit.', 'success');
+                    hideReconcileModal();
+                    loadLines(); // Refresh the lines
+                } else {
+                    const error = await response.json();
+                    showToast(error.error || 'Failed to approve reconciliation', 'error');
+                }
+            } catch (error) {
+                showToast('Network error occurred', 'error');
+            }
+        });
+
+        // Edit target and approve
+        document.getElementById('editTargetReconcileBtn').addEventListener('click', async () => {
+            if (!currentReconcileData) return;
+
+            const newTarget = parseInt(document.getElementById('newReconcileTarget').value);
+            if (isNaN(newTarget) || newTarget < 0) {
+                showToast('Please enter a valid target quantity', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/reconcile/resolve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        request_id: currentReconcileData.request.id,
+                        action: 'edit_target',
+                        new_target: newTarget
+                    })
+                });
+
+                if (response.ok) {
+                    showToast(`Target updated to ${newTarget} and approved! Counter can now submit.`, 'success');
+                    hideReconcileModal();
+                    loadLines(); // Refresh the lines
+                } else {
+                    const error = await response.json();
+                    showToast(error.error || 'Failed to update target', 'error');
+                }
+            } catch (error) {
+                showToast('Network error occurred', 'error');
+            }
+        });
+
+        // Confirm reset
+        document.getElementById('confirmResetBtn').addEventListener('click', async () => {
+            const passcode = document.getElementById('resetPasscode').value;
+
+            if (!passcode) {
+                showToast('Passcode is required', 'error');
+                return;
+            }
+
+            if (!resettingLine) {
+                showToast('No line selected for reset', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/line/reset', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        location: resettingLine.location,
+                        warehouse: resettingLine.warehouse,
+                        line_code: resettingLine.line_code,
+                        passcode: passcode
+                    }),
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.ok) {
+                    showToast(result.message, 'success');
+                    hideResetModal();
+                    loadLines();
+                } else {
+                    showToast(result.error || 'Failed to reset line', 'error');
+                }
+            } catch (error) {
+                console.error('Error resetting line:', error);
+                showToast('Network error occurred', 'error');
+            }
+        });
+
+        // Delete line
+        function deleteLine(lineId) {
+            deletingLine = currentLines.find(line => line.id === lineId);
+            if (!deletingLine) return;
+
+            // Check if current user can delete this line
+            const canDelete = window.isManager || (currentTL && currentTL.toLowerCase() === deletingLine.tl_name.toLowerCase());
+            if (!canDelete) {
+                if (window.isManager) {
+                    showToast('Manager access required for this action', 'error');
+                } else {
+                    showToast('You can only delete lines that you created', 'error');
+                }
+                return;
+            }
+
+            // Store the index of the line to be deleted
+            currentDeleteIndex = currentLines.findIndex(line => line.id === lineId);
+
+            let deleteMessage = `Are you sure you want to delete line "${deletingLine.line_code}"? This action cannot be undone.`;
+            if (window.isManager && currentTL !== deletingLine.tl_name) {
+                deleteMessage += ` (Originally created by ${deletingLine.tl_name})`;
+            }
+
+            document.getElementById('deleteMessage').textContent = deleteMessage;
+            deleteModal.classList.remove('hidden');
+        }
+
+        // Confirm delete
+        document.getElementById('confirmDeleteBtn').addEventListener('click', async function() {
+            const passcode = document.getElementById('deletePasscode').value;
+
+            if (passcode !== '240986') {
+                showToast('Invalid passcode', 'error');
+                return;
+            }
+
+            try {
+                // For managers, we need to get the line details and use manager privileges
+                const line = currentLines[currentDeleteIndex]; // Use the stored index
+
+                const response = await fetch('/api/line/delete', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Manager-Delete': 'true'  // Add manager flag
+                    },
+                    body: JSON.stringify({
+                        location: line.location,
+                        warehouse: line.warehouse,
+                        line_code: line.line_code,
+                        tl_name: line.tl_name,  // Use the TL name from the line data
+                        pin: '240986'  // Use the delete passcode for managers
+                    })
+                });
+
+                if (response.ok) {
+                    showToast('Line deleted successfully!', 'success');
+                    deleteModal.classList.add('hidden');
+                    document.getElementById('deletePasscode').value = '';
+                    loadLines();
+                } else {
+                    const error = await response.json();
+                    showToast(error.error || 'Delete failed', 'error');
+                }
+            } catch (error) {
+                showToast('Network error', 'error');
+            }
+        });
+
+        // Modal close handlers
+        document.getElementById('closeEditModal').addEventListener('click', function() {
+            editModal.classList.add('hidden');
+        });
+
+        document.getElementById('cancelEditBtn').addEventListener('click', function() {
+            editModal.classList.add('hidden');
+        });
+
+        document.getElementById('closeDeleteModal').addEventListener('click', function() {
+            deleteModal.classList.add('hidden');
+            document.getElementById('deletePasscode').value = '';
+        });
+
+        document.getElementById('cancelDeleteBtn').addEventListener('click', function() {
+            deleteModal.classList.add('hidden');
+            document.getElementById('deletePasscode').value = '';
+        });
+
+        // Toast function
+        function showToast(message, type = 'error') {
+            toastMessage.textContent = message;
+            toast.className = `fixed top-4 right-4 px-6 py-3 rounded-lg shadow-lg z-50 ${type === 'error' ? 'bg-red-500' : 'bg-green-500'} text-white`;
+            toast.classList.remove('hidden');
+
+            setTimeout(() => {
+                toast.classList.add('hidden');
+            }, 3000);
+        }
+
+        // Helper functions for showing success and error messages
+        function showError(message) {
+            showToast(message, 'error');
+        }
+
+        function showSuccess(message) {
+            showToast(message, 'success');
+        }
+
+        // Initialize
+        loadLines(); // Use the renamed function
+        setInterval(loadLines, 30000); // Refresh every 30 seconds
+    </script>
+</body>
+</html>

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BMAD ROUTE - Sign In</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-blue-900 mb-2">DSV STOCK COUNT</h1>
+            <p class="text-gray-600">Line-Based Stock Count System</p>
+        </div>
+
+        <div class="bg-white rounded-lg shadow-md p-6 max-w-md mx-auto">
+            <h2 class="text-xl font-semibold text-gray-800 mb-6 text-center">Sign In</h2>
+
+            <form id="signinForm">
+                <div class="mb-4">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Select Role</label>
+                    <select id="userRole" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" required>
+                        <option value="">Choose your role</option>
+                        <option value="counter">Counter</option>
+                        <option value="tl">Team Leader</option>
+                        <option value="manager">Manager</option>
+                    </select>
+                </div>
+
+                <div class="mb-4">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Name</label>
+                    <select id="userName" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" disabled required>
+                        <option value="">Select your name</option>
+                    </select>
+                </div>
+
+                <div class="mb-6">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Passcode</label>
+                    <input type="password" id="passcode" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="Enter passcode" required>
+                </div>
+
+                <button type="submit" class="w-full bg-blue-600 text-white py-3 px-6 rounded-lg hover:bg-blue-700 transition duration-200 font-medium">
+                    Sign In
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="fixed top-4 right-4 bg-red-500 text-white px-6 py-3 rounded-lg shadow-lg hidden z-50">
+        <span id="toastMessage"></span>
+    </div>
+
+    <script>
+        const counters = ["Hani", "hasan", "sami", "erol", "ali", "omar"];
+        const teamLeaders = ["Altaf", "Faran", "Rojin"];
+        const managers = ["Jawad", "Biju", "Hossam"];
+        const CORRECT_PASSCODE = "112233";
+
+        const roleSelect = document.getElementById('userRole');
+        const nameSelect = document.getElementById('userName');
+        const passcodeInput = document.getElementById('passcode');
+        const form = document.getElementById('signinForm');
+        const toast = document.getElementById('toast');
+        const toastMessage = document.getElementById('toastMessage');
+
+        // Update name dropdown based on role selection
+        roleSelect.addEventListener('change', function() {
+            const role = this.value;
+            nameSelect.innerHTML = '<option value="">Select your name</option>';
+            nameSelect.disabled = !role;
+
+            if (role === 'counter') {
+                counters.forEach(name => {
+                    const option = document.createElement('option');
+                    option.value = name;
+                    option.textContent = name;
+                    nameSelect.appendChild(option);
+                });
+            } else if (role === 'tl') {
+                teamLeaders.forEach(name => {
+                    const option = document.createElement('option');
+                    option.value = name;
+                    option.textContent = name;
+                    nameSelect.appendChild(option);
+                });
+            } else if (role === 'manager') {
+                managers.forEach(name => {
+                    const option = document.createElement('option');
+                    option.value = name;
+                    option.textContent = name;
+                    nameSelect.appendChild(option);
+                });
+            }
+        });
+
+        // Handle form submission
+        form.addEventListener('submit', function(e) {
+            e.preventDefault();
+
+            const role = roleSelect.value;
+            const name = nameSelect.value;
+            const passcode = passcodeInput.value;
+
+            if (!role || !name || !passcode) {
+                showToast('Please fill all fields', 'error');
+                return;
+            }
+
+            if (passcode !== CORRECT_PASSCODE) {
+                showToast('Incorrect passcode', 'error');
+                return;
+            }
+
+            // Store user info in localStorage
+            localStorage.setItem('dsv_user', JSON.stringify({
+                role: role,
+                name: name,
+                signedInAt: new Date().toISOString()
+            }));
+
+            // Redirect based on role
+            if (role === 'counter') {
+                window.location.href = '/';
+            } else if (role === 'tl') {
+                window.location.href = '/';
+            } else if (role === 'manager') {
+                window.location.href = '/';
+            }
+        });
+
+        // Toast function
+        function showToast(message, type = 'error') {
+            toastMessage.textContent = message;
+            toast.className = `fixed top-4 right-4 px-6 py-3 rounded-lg shadow-lg z-50 ${type === 'error' ? 'bg-red-500' : 'bg-green-500'} text-white`;
+            toast.classList.remove('hidden');
+
+            setTimeout(() => {
+                toast.classList.add('hidden');
+            }, 3000);
+        }
+
+        // Check if already signed in
+        const existingUser = localStorage.getItem('dsv_user');
+        if (existingUser) {
+            try {
+                const userData = JSON.parse(existingUser);
+                // Check if sign-in is still valid (within 8 hours)
+                const signedInTime = new Date(userData.signedInAt);
+                const now = new Date();
+                const hoursDiff = (now - signedInTime) / (1000 * 60 * 60);
+
+                if (hoursDiff < 8) {
+                    // Still valid, redirect to home
+                    window.location.href = '/';
+                }
+            } catch (e) {
+                // Invalid stored data, clear it
+                localStorage.removeItem('dsv_user');
+            }
+        }
+    </script>
+</body>
+</html>

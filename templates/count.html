@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>DSV STOCK COUNT - Counting: {{ line_code }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <!-- Sticky Header -->
+    <div class="sticky top-0 bg-blue-900 text-white p-4 shadow-lg z-40">
+        <div class="flex justify-between items-center">
+            <div>
+                <h1 class="font-bold text-lg">Counting: <span id="hdrLine">{{ line_code }}</span></h1>
+                <div class="text-sm opacity-90">
+                    <span id="counterInfo">Counter: {{ counter }}</span>
+                    <span class="mx-2">•</span>
+                    <span id="targetInfo">Target: Loading...</span>
+                    <span class="mx-2">•</span>
+                    <span id="scannedInfo">Scanned: 0</span>
+                </div>
+            </div>
+            <a href="/" class="bg-blue-700 hover:bg-blue-600 px-4 py-2 rounded text-sm">
+                ← Home
+            </a>
+        </div>
+        <div id="assignedCounters" class="text-sm mt-2 opacity-75"></div>
+    </div>
+
+    <div class="container mx-auto px-4 py-6">
+        <!-- Job Info Section -->
+        <div id="jobInfo" class="bg-blue-50 rounded-lg p-4 mb-6">
+            <div class="grid grid-cols-2 gap-4 text-center">
+                <div>
+                    <p class="text-sm text-gray-600">Scanned</p>
+                    <p class="text-2xl font-bold text-blue-900" id="scannedTotal">0</p>
+                </div>
+                <div>
+                    <p class="text-sm text-gray-600">Target</p>
+                    <p class="text-2xl font-bold text-blue-900" id="targetQty">0</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Camera Section -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Scan Items</h2>
+
+            <div class="mb-4">
+                <div class="relative rounded-lg overflow-hidden border" id="scannerWrap">
+                    <video id="video" class="w-full h-64 bg-black rounded-lg" playsinline muted></video>
+                    <div id="scanLaser" class="pointer-events-none absolute inset-0 hidden"></div>
+                </div>
+                <canvas id="canvas" class="hidden"></canvas>
+            </div>
+
+            <style>
+            #scanLaser::before{
+                content:"";
+                position:absolute;
+                top:0;
+                bottom:0;
+                width:2px;
+                background: linear-gradient(to bottom, transparent 0%, rgba(59,130,246,.9) 40%, rgba(59,130,246,.9) 60%, transparent 100%);
+                box-shadow: 0 0 10px rgba(59,130,246,.9), 0 0 20px rgba(59,130,246,.6);
+                transform: translateX(0);
+                animation: sweep 2.2s linear infinite;
+            }
+            @keyframes sweep{
+                0%   { left: 8%; }
+                50%  { left: 92%; }
+                100% { left: 8%; }
+            }
+            #scannerWrap.scanning #scanLaser {
+                display:block;
+            }
+            </style>
+
+            <div class="grid grid-cols-2 gap-4 mb-4">
+                <button id="startBtn" class="bg-blue-600 text-white py-3 px-6 rounded-lg hover:bg-blue-700 transition duration-200">
+                    Start Camera
+                </button>
+                <button id="torchBtn" class="bg-yellow-600 text-white py-3 px-6 rounded-lg hover:bg-yellow-700 transition duration-200 hidden">
+                    Torch Off
+                </button>
+            </div>
+
+            <!-- Multi-code picker -->
+            <div id="picker" class="fixed inset-0 bg-black bg-opacity-75 hidden z-50">
+                <div class="flex items-center justify-center min-h-screen p-4">
+                    <div class="bg-white rounded-lg max-w-md w-full p-6">
+                        <h3 class="text-lg font-semibold mb-4">Multiple Codes Found</h3>
+                        <div id="pickerList" class="space-y-2 mb-4"></div>
+                        <button id="pickerClose" class="w-full bg-gray-600 text-white py-2 px-4 rounded-lg">Cancel</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Manual Entry -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Manual Entry</h2>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">SKU (Optional)</label>
+                    <input type="text" id="sku" placeholder="SKU Code"
+                           class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500">
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Serial/Code *</label>
+                    <input type="text" id="code" placeholder="Enter or scan code"
+                           class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500">
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Quantity</label>
+                    <input type="number" id="qty" value="1" min="1"
+                           class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500">
+                </div>
+            </div>
+
+            <button id="addBtn" class="w-full bg-green-600 text-white py-3 px-6 rounded-lg hover:bg-green-700 transition duration-200 font-medium">
+                Add Item
+            </button>
+        </div>
+
+        <!-- Submit Section -->
+        <div class="bg-yellow-50 rounded-lg p-6">
+            <h3 class="text-lg font-semibold text-gray-800 mb-4">Submit Count</h3>
+
+            <button id="finalizeBtn" onclick="finalizeCount()" 
+                            class="w-full bg-gray-400 text-white font-bold py-2 px-4 rounded cursor-not-allowed" 
+                            disabled>
+                        Submit Final Count
+                    </button>
+
+                    <button id="requestReconBtn" onclick="requestReconciliation()" 
+                            class="w-full bg-orange-600 hover:bg-orange-700 text-white font-bold py-2 px-4 rounded hidden">
+                        Request Reconciliation
+                    </button>
+        </div>
+
+        <!-- Reconciliation Status -->
+        <div id="reconcileStatus" class="hidden mt-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+            <h4 class="font-semibold text-yellow-800 mb-2">🔔 Reconciliation Requested</h4>
+            <p class="text-sm text-yellow-700">Your reconciliation request has been sent to the Team Leader. Please wait for approval.</p>
+            <div id="reconcileResponse" class="mt-2 hidden">
+                <!-- TL response will appear here -->
+            </div>
+        </div>
+
+        <!-- TL Response Notification -->
+        <div id="tlResponseNotification" class="hidden mt-4 p-4 bg-green-50 border border-green-200 rounded-lg">
+            <h4 class="font-semibold text-green-800 mb-2">✅ Response from Team Leader</h4>
+            <div id="tlResponseContent" class="text-sm text-green-700">
+                <!-- TL response content will appear here -->
+            </div>
+            <button id="acknowledgeResponse" class="mt-3 bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700">
+                Acknowledge & Continue
+            </button>
+        </div>
+
+
+        <!-- Recent Scans -->
+        <div class="bg-white rounded-lg shadow-md p-6 mt-6">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Recent Scans</h2>
+            <div id="recentScans" class="space-y-2">
+                <!-- Recent scans will be populated here -->
+            </div>
+            <div id="recentList" class="space-y-2">
+                <!-- Legacy fallback -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Reconciliation Modal -->
+    <div id="reconcileModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 hidden items-center justify-center z-50">
+        <div class="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+            <h3 class="text-lg font-bold mb-4">Request Reconciliation</h3>
+
+            <div id="reconcileContent">
+                <div class="space-y-4">
+                    <div>
+                        <label for="reason" class="block text-sm font-medium text-gray-700 mb-2">Reason for Variance</label>
+                        <textarea id="reason" rows="4"
+                                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                  placeholder="Explain the reason for the variance... (This will be sent to your Team Leader for review)"></textarea>
+                    </div>
+
+                    <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3">
+                        <p class="text-sm text-yellow-800">
+                            <strong>Note:</strong> Your reconciliation request will be sent directly to your Team Leader.
+                            They will review and either approve the variance or adjust the target quantity.
+                        </p>
+                    </div>
+
+                    <button id="approveVarianceBtn"
+                            class="w-full bg-orange-600 text-white py-2 px-4 rounded-lg hover:bg-orange-700">
+                        Send Request to Team Leader
+                    </button>
+
+                    <button id="closeReconcile" class="w-full bg-gray-600 text-white py-2 px-4 rounded-lg">
+                        Cancel
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="fixed top-20 right-4 bg-red-500 text-white px-6 py-3 rounded-lg shadow-lg hidden z-50">
+        <span id="toastMessage"></span>
+    </div>
+
+    <!-- Barcode scanning libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/quagga@0.12.1/dist/quagga.min.js"></script>
+    <script>
+        // Check user authentication
+        function checkAuth() {
+            const userData = localStorage.getItem('dsv_user');
+            if (!userData) {
+                window.location.href = '/signin';
+                return false;
+            }
+
+            try {
+                const user = JSON.parse(userData);
+                const signedInTime = new Date(user.signedInAt);
+                const now = new Date();
+                const hoursDiff = (now - signedInTime) / (1000 * 60 * 60);
+
+                if (hoursDiff >= 8) {
+                    localStorage.removeItem('dsv_user');
+                    window.location.href = '/signin';
+                    return false;
+                }
+
+                // Only counters should access count page
+                if (user.role !== 'counter') {
+                    window.location.href = '/';
+                    return false;
+                }
+
+                return true;
+            } catch (e) {
+                localStorage.removeItem('dsv_user');
+                window.location.href = '/signin';
+                return false;
+            }
+        }
+
+        if (!checkAuth()) {
+            // Stop execution if not authenticated
+            document.body.innerHTML = '<div class="text-center p-8">Redirecting to sign in...</div>';
+        }
+    </script>
+    <script src="{{ url_for('static', filename='js/scanner.js') }}"></script>
+    <script>
+        // Global variables
+        let locationParam = null;
+        let warehouseParam = null;
+        let lineParam = null; // Renamed from lineCodeParam for consistency with URL params
+        let counterParam = null;
+
+        let currentJobId = null;
+        let jobState = null; // Holds the current state of the job
+
+        // Update header and info display
+        function updateHeaderAndInfo() {
+            if (!jobState) return;
+
+            const target = jobState.target_qty || jobState.target || 0;
+            const scanned = jobState.scanned_total || 0;
+
+            // Update header info
+            const targetInfo = document.getElementById('targetInfo');
+            const scannedInfo = document.getElementById('scannedInfo');
+            const scannedTotal = document.getElementById('scannedTotal');
+            const targetQty = document.getElementById('targetQty');
+
+            if (targetInfo) targetInfo.textContent = `Target: ${target}`;
+            if (scannedInfo) scannedInfo.textContent = `Scanned: ${scanned}`;
+            if (scannedTotal) scannedTotal.textContent = scanned;
+            if (targetQty) targetQty.textContent = target;
+
+
+            // Update assigned counters display
+            const assignedCounters = document.getElementById('assignedCounters');
+            if (assignedCounters && jobState.assigned) {
+                assignedCounters.textContent = `Assigned Counters: ${jobState.assigned.join(', ')}`;
+            }
+
+            // Update submit buttons
+            updateSubmitButtons();
+        }
+
+        // Update buttons based on job state
+        function updateSubmitButtons() {
+            const finalizeBtn = document.getElementById('finalizeBtn');
+            const requestReconBtn = document.getElementById('requestReconBtn');
+
+            if (!finalizeBtn || !requestReconBtn) return;
+
+            const canSubmit = (jobState.status === "variance_approved") ||
+                             (jobState.scanned_total === jobState.target_qty);
+
+            // Handle different statuses
+            if (jobState.status === "locked_recon") {
+                // Job is locked, hide both buttons
+                finalizeBtn.disabled = true;
+                finalizeBtn.classList.add("hidden");
+                requestReconBtn.classList.add("hidden");
+            } else if (canSubmit) {
+                // Can submit
+                finalizeBtn.disabled = false;
+                finalizeBtn.classList.remove("hidden");
+                requestReconBtn.classList.add("hidden");
+                finalizeBtn.textContent = 'Submit Final Count';
+                finalizeBtn.className = 'w-full bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded';
+            } else {
+                // Show request reconciliation
+                finalizeBtn.disabled = true;
+                finalizeBtn.classList.add("hidden");
+                requestReconBtn.classList.remove("hidden");
+                requestReconBtn.textContent = `Request Reconciliation (${jobState.scanned_total}/${jobState.target_qty})`;
+            }
+        }
+
+        // Request reconciliation handler
+        async function requestReconciliation() {
+            const reason = prompt("Reason for variance (optional):") || "";
+
+            try {
+                const response = await fetch('/api/reconcile/request', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({
+                        job_id: currentJobId,
+                        line_id: jobState.line_id,
+                        counter_name: counterParam,
+                        reason: reason
+                    })
+                });
+
+                if (!response.ok) {
+                    return; // No popup
+                }
+
+                const result = await response.json();
+                if (result.ok) {
+                    // Lock the job immediately
+                    jobState.status = "locked_recon";
+                    updateSubmitButtons();
+                    showToast('Reconciliation requested. Waiting for Team Leader approval.', 'info');
+                }
+            } catch (error) {
+                console.warn('Error requesting reconciliation:', error);
+            }
+        }
+
+
+        // Wait for DOM to be fully loaded before setting up event handlers
+        document.addEventListener('DOMContentLoaded', function() {
+            // Reconciliation functionality
+            const reconcileBtn = document.getElementById('reconcileBtn');
+            const reconcileModal = document.getElementById('reconcileModal');
+            const acknowledgeResponseBtn = document.getElementById('acknowledgeResponse'); // New button
+
+            if (reconcileBtn) {
+                reconcileBtn.addEventListener('click', function() {
+                    // Set current target in the edit field
+                    const newTargetInput = document.getElementById('newTarget');
+                    if (newTargetInput && jobState) {
+                        const target = jobState.target_qty || jobState.target || 0;
+                        newTargetInput.value = target;
+                    }
+
+                    // Show modal
+                    if (reconcileModal) {
+                        reconcileModal.classList.remove('hidden');
+                        reconcileModal.classList.add('flex');
+                    }
+                });
+            }
+
+            // Event handlers for reconciliation modal
+            const approveVarianceBtn = document.getElementById('approveVarianceBtn');
+            const closeReconcileBtn = document.getElementById('closeReconcile');
+            // const editTargetBtn = document.getElementById('editTargetBtn'); // Removed
+
+            if (approveVarianceBtn) {
+                approveVarianceBtn.addEventListener('click', function() {
+                    handleReconciliation();
+                });
+            }
+
+            if (closeReconcileBtn) {
+                closeReconcileBtn.addEventListener('click', function() {
+                    if (reconcileModal) {
+                        reconcileModal.classList.add('hidden');
+                        reconcileModal.classList.remove('flex');
+                    }
+                    // Reset form logic removed since Edit Target button is removed
+                    // Clear form fields
+                    const tlPin = document.getElementById('tlPin');
+                    const reason = document.getElementById('reason');
+                    if (tlPin) tlPin.value = '';
+                    if (reason) reason.value = '';
+                });
+            }
+
+            // Handle acknowledgment of TL response
+            if (acknowledgeResponseBtn) {
+                acknowledgeResponseBtn.addEventListener('click', async function() {
+                    const tlResponseNotification = document.getElementById('tlResponseNotification');
+                    if (tlResponseNotification) {
+                        tlResponseNotification.classList.add('hidden');
+                        tlResponseNotification.classList.remove('flex');
+                    }
+
+                    // Refresh job state to get updated status
+                    await refreshJobState();
+
+                    // Show success message
+                    showToast('Response acknowledged. You can now submit your final count.', 'success');
+                });
+            }
+        });
+
+        // Handle reconciliation request
+        async function handleReconciliation() {
+            const reason = document.getElementById('reason').value;
+
+            if (!reason.trim()) {
+                showToast('Please provide a reason for reconciliation', 'error');
+                return;
+            }
+
+            try {
+                // Request reconciliation (goes to TL queue)
+                const response = await fetch('/api/reconcile/request', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        job_id: currentJobId,
+                        reason: reason,
+                        requested_by: counterParam
+                    })
+                });
+
+                if (response.ok) {
+                    showToast('Reconciliation request sent to Team Leader. Please wait for response...', 'success');
+
+                    // Show reconciliation status
+                    const reconcileStatusDiv = document.getElementById('reconcileStatus');
+                    if (reconcileStatusDiv) {
+                        reconcileStatusDiv.classList.remove('hidden');
+                        reconcileStatusDiv.classList.add('block');
+                    }
+
+                    // Close modal
+                    const reconcileModal = document.getElementById('reconcileModal');
+                    if (reconcileModal) {
+                        reconcileModal.classList.add('hidden');
+                        reconcileModal.classList.remove('flex');
+                    }
+
+                    // Reset form
+                    document.getElementById('reason').value = '';
+
+                    // Update button to show request is pending
+                    const reconcileBtn = document.getElementById('reconcileBtn');
+                    if (reconcileBtn) {
+                        reconcileBtn.textContent = 'Request Sent - Waiting for TL';
+                        reconcileBtn.disabled = true;
+                        reconcileBtn.classList.add('bg-yellow-400');
+                        reconcileBtn.classList.remove('bg-orange-600');
+                    }
+                } else {
+                    const result = await response.json();
+                    showToast(result.error || 'Error sending reconciliation request', 'error');
+                }
+            } catch (error) {
+                console.error('Reconciliation error:', error);
+                showToast('Network error during reconciliation request', 'error');
+            }
+        }
+
+        // Elements
+        const targetInfo = document.getElementById('targetInfo');
+        const scannedInfo = document.getElementById('scannedInfo');
+        const assignedCounters = document.getElementById('assignedCounters');
+        const scannedTotal = document.getElementById('scannedTotal');
+        const targetQty = document.getElementById('targetQty');
+        const finalizeBtn = document.getElementById('finalizeBtn');
+        const reconcileBtn = document.getElementById('reconcileBtn'); // This is the old button, kept for now
+        const recentList = document.getElementById('recentList');
+        const recentScans = document.getElementById('recentScans');
+        const toast = document.getElementById('toast');
+        const toastMessage = document.getElementById('toastMessage');
+
+        // Function to update the displayed totals
+        function updateDisplayedTotal() {
+            if (!jobState) return;
+            const target = jobState.target_qty || jobState.target || 0;
+            const scanned = jobState.scanned_total || 0;
+            if (scannedTotal) scannedTotal.textContent = scanned;
+            if (targetQty) targetQty.textContent = target;
+        }
+
+        // Load job state
+        async function refreshJobState() {
+            try {
+                const qs = new URLSearchParams({
+                    location: locationParam,
+                    warehouse: warehouseParam,
+                    line_code: lineParam,
+                    counter: counterParam
+                });
+                const response = await fetch(`/api/job/state?${qs.toString()}`, {
+                    credentials: 'same-origin'
+                });
+
+                if (response.ok) {
+                    jobState = await response.json();
+                    currentJobId = jobState.job_id;
+
+                    // Update all display elements
+                    updateHeaderAndInfo();
+
+                    // Check if counter is assigned
+                    if (!jobState.is_assigned) {
+                        showToast('Warning: You are not assigned to this line!', 'error');
+                    }
+
+                    loadRecentScans();
+
+                    // Update submit buttons based on new state
+                    updateSubmitButtons();
+
+                } else {
+                    const error = await response.json();
+                    if (!response.ok && error.reason === 'line_completed') {
+                      alert(error.message || "This line has been completed. Contact your Team Leader for a new assignment.");
+                      history.back();
+                      return;
+                    }
+                    if (!response.ok && error.reason === 'line_not_configured') {
+                      alert("Line not configured.");
+                      history.back();
+                      return;
+                    }
+                    showToast(error.error || 'Failed to load job state', 'error');
+                }
+            } catch (err) {
+                showToast('Network error loading job state', 'error');
+            }
+        }
+
+        // Handle scan result
+        function handleScanResult(result) {
+            addScan(result, 'scan');
+        }
+
+        // Add scan via API
+        async function addScan(serialCode, source = 'manual') {
+            if (!currentJobId) {
+                showToast('No active job found', 'error');
+                return;
+            }
+
+            const sku = document.getElementById('sku').value.trim();
+            const qty = parseInt(document.getElementById('qty').value) || 1;
+
+            if (!serialCode.trim()) {
+                return; // Silent - operator continues
+            }
+
+            const data = {
+                job_id: currentJobId,
+                line_id: jobState.line_id,
+                counter_name: counterParam,
+                sku: sku,
+                serial_or_code: serialCode,
+                qty: qty,
+                source: source
+            };
+
+            try {
+                const response = await fetch('/api/scan/add', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    credentials: 'same-origin',
+                    body: JSON.stringify(data)
+                });
+
+                if (response.status === 409) {
+                    // True duplicate
+                    showToast('Duplicate: same SKU & Serial already scanned', 'error');
+                    return;
+                }
+
+                if (!response.ok) {
+                    console.warn('Add failed', response.status);
+                    return; // No popup
+                }
+
+                const result = await response.json();
+                if (result.ok) {
+                    // Update the scanned total
+                    jobState.scanned_total = result.scanned_total;
+                    updateDisplayedTotal();
+
+                    // Clear the form
+                    document.getElementById('sku').value = '';
+                    document.getElementById('serial').value = ''; // Assuming 'serial' is the ID for the serial code input
+                    document.getElementById('qty').value = '1';
+
+                    // Update submit buttons
+                    updateSubmitButtons();
+
+                    // Load recent scans
+                    loadRecentScans();
+                }
+            } catch (error) {
+                console.warn('Network error adding scan:', error);
+            }
+        }
+
+        // Load recent scans
+        async function loadRecentScans() {
+            if (!currentJobId) return;
+
+            try {
+                const response = await fetch(`/api/recent-scans?job_id=${currentJobId}`);
+                if (response.ok) {
+                    const scans = await response.json();
+
+                    // Clear both containers
+                    const recentScansContainer = document.getElementById('recentScans');
+                    const recentListContainer = document.getElementById('recentList');
+
+                    if (recentScansContainer) recentScansContainer.innerHTML = '';
+                    if (recentListContainer) recentListContainer.innerHTML = '';
+
+                    // Use recentScans if available, fallback to recentList
+                    const container = recentScansContainer || recentListContainer;
+                    if (container) {
+                        scans.forEach(scan => {
+                            const div = document.createElement('div');
+                            div.className = 'flex justify-between items-center p-3 bg-gray-50 rounded-lg';
+                            div.innerHTML = `
+                                <div>
+                                    <div class="font-medium">${scan.serial_code}</div>
+                                    <div class="text-sm text-gray-600">${scan.sku || 'No SKU'} • Qty: ${scan.qty} • ${scan.source}</div>
+                                </div>
+                                <div class="text-sm text-gray-500">
+                                    ${scan.counter_name}<br>${scan.time}
+                                </div>
+                            `;
+                            container.appendChild(div);
+                        });
+                    }
+                }
+            } catch (err) {
+                console.error('Failed to load recent scans:', err);
+            }
+        }
+
+        // Manual entry - add null check
+        const addBtn = document.getElementById('addBtn');
+        if (addBtn) {
+            addBtn.addEventListener('click', function() {
+                const code = document.getElementById('code').value.trim();
+                if (!code) {
+                    showToast('Please enter a serial/code', 'error');
+                    return;
+                }
+
+                addScan(code, 'manual');
+            });
+        }
+
+        // Finalize submit - add null check
+        if (finalizeBtn) {
+            finalizeBtn.addEventListener('click', async function() {
+            if (!currentJobId) return;
+
+            // Double check that scanned equals target
+            const target = jobState.target_qty || jobState.target || 0;
+            const scanned = jobState.scanned_total || 0;
+
+            if (scanned !== target) {
+                showToast(`Cannot submit: Scanned (${scanned}) does not match target (${target})`, 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/submit/final', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ job_id: currentJobId, counter_name: counterParam })
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.ok) {
+                    showToast('Job submitted successfully!', 'success');
+                    // Immediately redirect to home page
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 1000);
+                } else {
+                    showToast(result.error || 'Submit failed', 'error');
+                }
+
+            } catch (err) {
+                showToast('Network error', 'error');
+            }
+            });
+        }
+
+        // Toast function
+        function showToast(message, type = 'error') {
+            if (toastMessage) toastMessage.textContent = message;
+            if (toast) {
+                toast.className = `fixed top-20 right-4 px-6 py-3 rounded-lg shadow-lg z-50 ${type === 'error' ? 'bg-red-500' : 'bg-green-500'} text-white`;
+                toast.classList.remove('hidden');
+
+                setTimeout(() => {
+                    toast.classList.add('hidden');
+                }, type === 'success' ? 2000 : 4000);
+            }
+        }
+
+        // Auto-refresh status polling
+        let pollInterval;
+
+        function startPolling() {
+            pollInterval = setInterval(async () => {
+                try {
+                    const qs = new URLSearchParams({
+                        location: locationParam,
+                        warehouse: warehouseParam,
+                        line_code: lineParam,
+                        counter: counterParam
+                    });
+                    const response = await fetch(`/api/job/state?${qs.toString()}`, {
+                        credentials: 'same-origin'
+                    });
+
+                    if (!response.ok) return;
+
+                    const data = await response.json();
+                    if (!data.ok) return;
+
+                    // Update job state if it has changed
+                    if (data.status !== jobState.status || data.target_qty !== jobState.target_qty || data.scanned_total !== jobState.scanned_total) {
+                        jobState.status = data.status;
+                        jobState.target_qty = data.target_qty;
+                        jobState.scanned_total = data.scanned_total;
+
+                        // Update display
+                        updateDisplayedTotal();
+                        updateSubmitButtons();
+                    }
+
+                } catch (error) {
+                    console.warn('Polling error:', error);
+                }
+            }, 3000);
+        }
+
+        // Initialize the page
+        window.addEventListener('DOMContentLoaded', function() {
+            // Parse URL parameters
+            const urlParams = new URLSearchParams(window.location.search);
+            locationParam = urlParams.get('location');
+            warehouseParam = urlParams.get('warehouse');
+            lineParam = urlParams.get('line');
+            counterParam = urlParams.get('counter');
+
+            if (!locationParam || !warehouseParam || !lineParam || !counterParam) {
+                alert('Missing required parameters');
+                history.back();
+                return;
+            }
+
+            // Set page title
+            document.title = `Count - ${locationParam}/${warehouseParam}/Line ${lineParam}`;
+
+            // Update display
+            const locationDisplay = document.getElementById('locationDisplay');
+            const warehouseDisplay = document.getElementById('warehouseDisplay');
+            const lineDisplay = document.getElementById('lineDisplay');
+            const counterDisplay = document.getElementById('counterDisplay');
+
+            if (locationDisplay) locationDisplay.textContent = locationParam;
+            if (warehouseDisplay) warehouseDisplay.textContent = warehouseParam;
+            if (lineDisplay) lineDisplay.textContent = lineParam;
+            if (counterDisplay) counterDisplay.textContent = counterParam;
+
+            // Load initial state and start polling
+            refreshJobState().then(() => {
+                startPolling();
+            });
+        });
+
+        // Start scanner
+        function startScanner() {
+            try {
+                // Set up scanner callback if available
+                if (window.scannerModule && typeof window.scannerModule.onScanResult === 'function') {
+                    window.scannerModule.onScanResult = handleScanResult;
+                } else {
+                    console.warn("scannerModule or onScanResult not available. Scanner functionality might be limited.");
+                }
+
+                // Initialize scanner if scanner.js is loaded
+                if (window.scannerModule && typeof window.scannerModule.start === 'function') {
+                    window.scannerModule.start();
+                }
+            } catch (error) {
+                console.warn('Scanner initialization failed:', error);
+                // Don't show error toast for camera issues - just log it
+            }
+        }
+
+        // Load initial job state and start scanner
+        async function loadJobState() {
+            await refreshJobState();
+            await loadRecentScans();
+            startScanner();
+        }
+
+        // Start page initialization
+        loadJobState();
+
+        // Check for TL responses to reconciliation requests
+        let checkingResponse = false;
+        setInterval(async () => {
+            if (!currentJobId || checkingResponse) return;
+
+            checkingResponse = true;
+            try {
+                const response = await fetch(`/api/reconcile/check_response?job_id=${currentJobId}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.resolved) {
+                        const tlResponseNotification = document.getElementById('tlResponseNotification');
+                        const tlResponseContent = document.getElementById('tlResponseContent');
+
+                        if (tlResponseNotification && tlResponseContent) {
+                            tlResponseContent.innerHTML = data.response.replace(/\n/g, '<br>'); // Display response with line breaks
+                            tlResponseNotification.classList.remove('hidden');
+                            tlResponseNotification.classList.add('block'); // Use 'block' or 'flex' depending on desired display
+                        }
+                        showToast(`Response from TL: ${data.response}`, 'success'); // Show toast as well
+                        // Refresh job state to get updated target/status
+                        await refreshJobState();
+                        // Reset job state status if it was variance_approved to allow resubmission
+                        if (jobState.status === 'variance_approved') {
+                            jobState.status = 'open'; // Reset to open to allow normal flow
+                            updateSubmitButtons();
+                        }
+                    }
+                }
+            } catch (e) {
+                // Silent fail - don't spam user with network errors
+            } finally {
+                checkingResponse = false;
+            }
+        }, 3000); // Check every 3 seconds
+    </script>
+</body>
+</html>

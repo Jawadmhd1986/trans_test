@@ -1,0 +1,409 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DSV STOCK COUNT - Insights Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <script>
+        // Check Manager authentication
+        function checkManagerAuth() {
+            const userData = localStorage.getItem('dsv_user');
+            if (!userData) {
+                window.location.href = '/signin';
+                return false;
+            }
+
+            try {
+                const user = JSON.parse(userData);
+                const signedInTime = new Date(user.signedInAt);
+                const now = new Date();
+                const hoursDiff = (now - signedInTime) / (1000 * 60 * 60);
+
+                if (hoursDiff >= 8) {
+                    localStorage.removeItem('dsv_user');
+                    window.location.href = '/signin';
+                    return false;
+                }
+
+                // Only Managers should access insights page
+                if (user.role !== 'manager') {
+                    window.location.href = '/';
+                    return false;
+                }
+
+                return true;
+            } catch (e) {
+                localStorage.removeItem('dsv_user');
+                window.location.href = '/signin';
+                return false;
+            }
+        }
+
+        if (!checkManagerAuth()) {
+            document.body.innerHTML = '<div class="text-center p-8">Redirecting to sign in...</div>';
+        }
+    </script>
+
+    <div class="container mx-auto px-4 py-8">
+        <div class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-3xl font-bold text-blue-900 mb-2">DSV STOCK COUNT - Insights Dashboard</h1>
+                <p class="text-gray-600">Manager-only analytics and progress monitoring</p>
+                
+                <!-- User Info -->
+                <div id="userInfo" class="mt-4 p-3 bg-blue-50 rounded-lg inline-block">
+                    <span id="userDisplay" class="text-blue-800 font-medium"></span>
+                    <button id="signOutBtn" class="ml-3 text-blue-600 hover:text-blue-800 text-sm underline">Sign Out</button>
+                </div>
+            </div>
+            <div class="text-right">
+                <a href="/" class="bg-gray-600 text-white py-2 px-4 rounded-lg hover:bg-gray-700 transition duration-200">
+                    ← Back to Home
+                </a>
+                <button id="refreshData" class="ml-2 bg-blue-600 text-white py-2 px-4 rounded-lg hover:bg-blue-700 transition duration-200">
+                    🔄 Refresh Data
+                </button>
+            </div>
+        </div>
+
+        <!-- Key Metrics Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h3 class="text-sm font-medium text-gray-500">Total Lines</h3>
+                        <p id="totalLines" class="text-3xl font-bold text-blue-600">-</p>
+                    </div>
+                    <div class="text-blue-500">
+                        <svg class="w-8 h-8" fill="currentColor" viewBox="0 0 20 20">
+                            <path d="M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zM3 10a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6zM14 9a1 1 0 00-1 1v6a1 1 0 001 1h2a1 1 0 001-1v-6a1 1 0 00-1-1h-2z"/>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h3 class="text-sm font-medium text-gray-500">Active Jobs</h3>
+                        <p id="activeJobs" class="text-3xl font-bold text-green-600">-</p>
+                    </div>
+                    <div class="text-green-500">
+                        <svg class="w-8 h-8" fill="currentColor" viewBox="0 0 20 20">
+                            <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z"/>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h3 class="text-sm font-medium text-gray-500">Completed Jobs</h3>
+                        <p id="completedJobs" class="text-3xl font-bold text-purple-600">-</p>
+                    </div>
+                    <div class="text-purple-500">
+                        <svg class="w-8 h-8" fill="currentColor" viewBox="0 0 20 20">
+                            <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"/>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h3 class="text-sm font-medium text-gray-500">Total Scans</h3>
+                        <p id="totalScans" class="text-3xl font-bold text-orange-600">-</p>
+                    </div>
+                    <div class="text-orange-500">
+                        <svg class="w-8 h-8" fill="currentColor" viewBox="0 0 20 20">
+                            <path d="M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zM3 10a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6zM14 9a1 1 0 00-1 1v6a1 1 0 001 1h2a1 1 0 001-1v-6a1 1 0 00-1-1h-2z"/>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Charts Row -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+            <!-- Progress by Location Chart -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-lg font-semibold mb-4">Progress by Location</h3>
+                <canvas id="locationChart" width="400" height="200"></canvas>
+            </div>
+
+            <!-- Job Status Distribution -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-lg font-semibold mb-4">Job Status Distribution</h3>
+                <canvas id="statusChart" width="400" height="200"></canvas>
+            </div>
+        </div>
+
+        <!-- Team Leaders Performance -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+            <h3 class="text-lg font-semibold mb-4">Team Leaders Performance</h3>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Team Leader</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Lines Managed</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Active Jobs</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Completed Jobs</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total Scans</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Completion Rate</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tlPerformanceTable" class="bg-white divide-y divide-gray-200">
+                        <!-- Data will be populated by JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Active Lines Detail -->
+        <div class="bg-white rounded-lg shadow-md p-6">
+            <h3 class="text-lg font-semibold mb-4">Active Lines Detail</h3>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Line Code</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Location</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Warehouse</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Target</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Scanned</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Progress</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Assigned Counters</th>
+                        </tr>
+                    </thead>
+                    <tbody id="activeLinesTable" class="bg-white divide-y divide-gray-200">
+                        <!-- Data will be populated by JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="fixed top-4 right-4 bg-red-500 text-white px-6 py-3 rounded-lg shadow-lg hidden z-50">
+        <span id="toastMessage"></span>
+    </div>
+
+    <script>
+        let locationChart, statusChart;
+
+        // Initialize user display
+        const userData = JSON.parse(localStorage.getItem('dsv_user'));
+        document.getElementById('userDisplay').textContent = `MANAGER: ${userData.name}`;
+
+        // Sign out functionality
+        document.getElementById('signOutBtn').addEventListener('click', function() {
+            localStorage.removeItem('dsv_user');
+            window.location.href = '/signin';
+        });
+
+        // Refresh data button
+        document.getElementById('refreshData').addEventListener('click', function() {
+            loadInsightsData();
+        });
+
+        // Toast function
+        function showToast(message, type = 'error') {
+            const toast = document.getElementById('toast');
+            const toastMessage = document.getElementById('toastMessage');
+            
+            toastMessage.textContent = message;
+            toast.className = `fixed top-4 right-4 px-6 py-3 rounded-lg shadow-lg z-50 ${type === 'error' ? 'bg-red-500' : 'bg-green-500'} text-white`;
+            toast.classList.remove('hidden');
+
+            setTimeout(() => {
+                toast.classList.add('hidden');
+            }, 3000);
+        }
+
+        // Load insights data
+        async function loadInsightsData() {
+            try {
+                const response = await fetch('/api/insights/dashboard');
+                if (!response.ok) {
+                    throw new Error('Failed to fetch insights data');
+                }
+                
+                const data = await response.json();
+                
+                // Update key metrics
+                document.getElementById('totalLines').textContent = data.totalLines || 0;
+                document.getElementById('activeJobs').textContent = data.activeJobs || 0;
+                document.getElementById('completedJobs').textContent = data.completedJobs || 0;
+                document.getElementById('totalScans').textContent = data.totalScans || 0;
+
+                // Update charts
+                updateLocationChart(data.locationData || []);
+                updateStatusChart(data.statusData || []);
+
+                // Update tables
+                updateTLPerformanceTable(data.tlPerformance || []);
+                updateActiveLinesTable(data.activeLines || []);
+
+                showToast('Data refreshed successfully', 'success');
+            } catch (error) {
+                console.error('Error loading insights data:', error);
+                showToast('Error loading insights data');
+            }
+        }
+
+        // Update location chart
+        function updateLocationChart(data) {
+            const ctx = document.getElementById('locationChart').getContext('2d');
+            
+            if (locationChart) {
+                locationChart.destroy();
+            }
+            
+            locationChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: data.map(d => d.location),
+                    datasets: [{
+                        label: 'Lines',
+                        data: data.map(d => d.lines),
+                        backgroundColor: 'rgba(59, 130, 246, 0.5)',
+                        borderColor: 'rgb(59, 130, 246)',
+                        borderWidth: 1
+                    }, {
+                        label: 'Active Jobs',
+                        data: data.map(d => d.activeJobs),
+                        backgroundColor: 'rgba(16, 185, 129, 0.5)',
+                        borderColor: 'rgb(16, 185, 129)',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            beginAtZero: true
+                        }
+                    }
+                }
+            });
+        }
+
+        // Update status chart
+        function updateStatusChart(data) {
+            const ctx = document.getElementById('statusChart').getContext('2d');
+            
+            if (statusChart) {
+                statusChart.destroy();
+            }
+            
+            statusChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: data.map(d => d.status),
+                    datasets: [{
+                        data: data.map(d => d.count),
+                        backgroundColor: [
+                            'rgba(59, 130, 246, 0.8)',
+                            'rgba(16, 185, 129, 0.8)',
+                            'rgba(139, 92, 246, 0.8)',
+                            'rgba(251, 146, 60, 0.8)'
+                        ]
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: {
+                            position: 'bottom'
+                        }
+                    }
+                }
+            });
+        }
+
+        // Update TL performance table
+        function updateTLPerformanceTable(data) {
+            const tbody = document.getElementById('tlPerformanceTable');
+            tbody.innerHTML = '';
+
+            data.forEach(tl => {
+                const row = document.createElement('tr');
+                const completionRate = tl.completedJobs > 0 ? 
+                    ((tl.completedJobs / (tl.activeJobs + tl.completedJobs)) * 100).toFixed(1) : '0.0';
+                
+                row.innerHTML = `
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${tl.name}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${tl.linesManaged}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${tl.activeJobs}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${tl.completedJobs}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${tl.totalScans}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <div class="flex items-center">
+                            <div class="w-full bg-gray-200 rounded-full h-2 mr-2">
+                                <div class="bg-blue-600 h-2 rounded-full" style="width: ${completionRate}%"></div>
+                            </div>
+                            <span class="text-xs">${completionRate}%</span>
+                        </div>
+                    </td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        // Update active lines table
+        function updateActiveLinesTable(data) {
+            const tbody = document.getElementById('activeLinesTable');
+            tbody.innerHTML = '';
+
+            data.forEach(line => {
+                const row = document.createElement('tr');
+                const progress = line.target > 0 ? ((line.scanned / line.target) * 100).toFixed(1) : '0.0';
+                const statusColor = line.status === 'open' ? 'bg-green-100 text-green-800' : 
+                                   line.status === 'submitted' ? 'bg-blue-100 text-blue-800' : 
+                                   'bg-purple-100 text-purple-800';
+                
+                row.innerHTML = `
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${line.lineCode}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${line.location}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${line.warehouse}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${line.target}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${line.scanned}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <div class="flex items-center">
+                            <div class="w-full bg-gray-200 rounded-full h-2 mr-2">
+                                <div class="bg-blue-600 h-2 rounded-full" style="width: ${Math.min(progress, 100)}%"></div>
+                            </div>
+                            <span class="text-xs">${progress}%</span>
+                        </div>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap">
+                        <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${statusColor}">
+                            ${line.status}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${line.assignedCounters}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        // Load data on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            loadInsightsData();
+            
+            // Auto-refresh every 30 seconds
+            setInterval(loadInsightsData, 30000);
+        });
+    </script>
+</body>
+</html>

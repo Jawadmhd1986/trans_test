@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BMAD ROUTE - Line Count</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-blue-900 mb-2">DSV STOCK COUNT</h1>
+            <p class="text-gray-600">Line-Based Stock Count System</p>
+
+            <!-- User Info -->
+            <div id="userInfo" class="mt-4 p-3 bg-blue-50 rounded-lg inline-block">
+                <span id="userDisplay" class="text-blue-800 font-medium"></span>
+                <button id="signOutBtn" class="ml-3 text-blue-600 hover:text-blue-800 text-sm underline">Sign Out</button>
+            </div>
+        </div>
+
+        <!-- Counter Section -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Counter Access</h2>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Location</label>
+                    <select id="location" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500">
+                        <option value="">Select Location</option>
+                        {% for location in locations %}
+                        <option value="{{ location }}">{{ location }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Warehouse</label>
+                    <select id="warehouse" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" disabled>
+                        <option value="">Select Warehouse</option>
+                    </select>
+                </div>
+            </div>
+
+            <form id="startForm">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Line Code</label>
+                        <select id="lineCode" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500">
+                            <option value="">Select Line (configured by TL)</option>
+                        </select>
+                        <small id="targetHint" class="text-gray-600">Line not configured by Team Leader.</small>
+                    </div>
+
+                    <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Counter Name</label>
+                    <input type="text" id="counterName" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="Your counter name will appear here">
+                </div>
+                </div>
+
+                <button type="submit" id="startBtn" disabled class="w-full bg-blue-600 text-white py-3 px-6 rounded-lg hover:bg-blue-700 transition duration-200 font-medium disabled:bg-gray-400">
+                    Start/Continue Counting
+                </button>
+            </form>
+        </div>
+
+        <!-- Team Leader Section -->
+        <div id="tlSection" class="bg-white rounded-lg shadow-md p-6">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Team Leader Actions</h2>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <button id="tlSetupBtn" class="bg-green-600 text-white py-3 px-6 rounded-lg hover:bg-green-700 transition duration-200 font-medium">
+                    Setup Line & Assign Counters
+                </button>
+
+                <a href="/line-management" class="relative bg-yellow-600 text-white py-3 px-6 rounded-lg hover:bg-yellow-700 transition duration-200 font-medium text-center block">
+                    Line Management
+                    <span id="reconcileNotificationBadge" class="hidden absolute -top-2 -right-2 bg-red-500 text-white text-xs rounded-full h-6 w-6 flex items-center justify-center animate-pulse">
+                        0
+                    </span>
+                    <div class="text-xs opacity-75 mt-1">Manage Lines & Reconciliation</div>
+                </a>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                <a href="/line-management" class="block w-full text-center bg-purple-600 text-white py-3 px-6 rounded-lg hover:bg-purple-700 transition duration-200 font-medium">
+                    Line Management
+                </a>
+                <a href="/log" class="block w-full text-center bg-gray-600 text-white py-3 px-6 rounded-lg hover:bg-gray-700 transition duration-200 font-medium">
+                    View Submission Log
+                </a>
+            </div>
+            
+            <!-- Manager-only Insights Link -->
+            <div id="managerInsights" class="mt-4 hidden">
+                <a href="/insights" class="block w-full text-center bg-indigo-600 text-white py-3 px-6 rounded-lg hover:bg-indigo-700 transition duration-200 font-medium">
+                    📊 Insights Dashboard
+                </a>
+            </div></div>
+        </div>
+    </div>
+
+    <!-- TL PIN Modal -->
+    <div id="tlModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50">
+        <div class="flex items-center justify-center min-h-screen p-4">
+            <div class="bg-white rounded-lg max-w-md w-full p-6">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 id="modalTitle" class="text-lg font-semibold">Team Leader Access</h3>
+                    <button id="closeModal" class="text-gray-400 hover:text-gray-600">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                    </button>
+                </div>
+
+                <div id="modalContent">
+                    <!-- Content will be populated by JavaScript -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reconciliation Center Modal -->
+    <div id="reconModal" class="hidden fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center">
+        <div class="bg-white rounded-lg max-w-2xl w-full m-4 p-6">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-lg font-semibold">Reconciliation Center</h3>
+                <button id="reconClose" class="text-gray-400 hover:text-gray-600">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                    </svg>
+                </button>
+            </div>
+
+            <div class="grid grid-cols-2 gap-3 mb-3">
+                <div>
+                    <label class="text-sm font-medium text-gray-700">TL Name</label>
+                    <input id="recTlName" class="w-full border rounded p-2" placeholder="Altaf">
+                </div>
+                <div>
+                    <label class="text-sm font-medium text-gray-700">TL PIN</label>
+                    <input id="recTlPin" type="password" class="w-full border rounded p-2" placeholder="••••">
+                </div>
+                <div>
+                    <label class="text-sm font-medium text-gray-700">Location</label>
+                    <select id="recLocation" class="w-full border rounded p-2">
+                        <option>KIZAD</option>
+                        <option>JEBEL_ALI</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="text-sm font-medium text-gray-700">Warehouse</label>
+                    <select id="recWarehouse" class="w-full border rounded p-2">
+                        <option>KIZAD-W1</option>
+                        <option>JA-W1</option>
+                        <option>JA-W2</option>
+                        <option>JA-W3</option>
+                    </select>
+                </div>
+                <div class="col-span-2">
+                    <label class="text-sm font-medium text-gray-700">Line Code</label>
+                    <select id="recLineCode" class="w-full border rounded p-2" disabled>
+                        <option value="">Login first to load your lines</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="flex gap-3 mb-3">
+                <button id="recLoginBtn" class="bg-gray-900 text-white px-4 py-2 rounded">Login</button>
+            </div>
+
+            <div id="recState" class="text-sm mb-3 p-3 bg-gray-50 rounded">Login to view state.</div>
+
+            <div id="recActions" class="hidden">
+                <div class="mb-3">
+                    <label class="text-sm font-medium text-gray-700">Current Target Quantity</label>
+                    <input id="recCurrentTarget" type="number" readonly class="w-full border rounded p-2 bg-gray-100" placeholder="Current target will appear here">
+                </div>
+                <div class="grid grid-cols-2 gap-3 mb-3">
+                    <div>
+                        <label class="text-sm font-medium text-gray-700">New Target Quantity</label>
+                        <input id="recNewTarget" type="number" min="0" class="w-full border rounded p-2">
+                    </div>
+                    <div>
+                        <label class="text-sm font-medium text-gray-700">Note (variance)</label>
+                        <input id="recNote" class="w-full border rounded p-2" placeholder="Reason / note">
+                    </div>
+                </div>
+                <div class="flex space-x-2">
+                        <button id="recEditTargetBtn" 
+                                class="bg-blue-600 text-white py-2 px-4 rounded-lg hover:bg-blue-700">
+                            Edit Target
+                        </button>
+                        <button id="recApproveVarBtn" 
+                                class="bg-green-600 text-white py-2 px-4 rounded-lg hover:bg-green-700">
+                            Approve Variance
+                        </button>
+                    </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="fixed top-4 right-4 bg-red-500 text-white px-6 py-3 rounded-lg shadow-lg hidden z-50">
+        <span id="toastMessage"></span>
+    </div>
+
+    <script>
+        window.warehouses = {{ warehouses|tojson }};
+    </script>
+    <script src="{{ url_for('static', filename='js/home.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/reconcile.js') }}"></script>
+</body>
+</html>
